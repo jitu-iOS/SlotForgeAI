@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+.env.local
+
+# auth user store (JSON file-backed DB) — runtime data, never commit
+/data
+
+# scratch / unused folders kept locally only
+/backend
+/claude
+.claude
+
+# Claude Code session logs / artifacts
+*.session.json

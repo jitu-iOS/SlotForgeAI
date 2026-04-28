@@ -1,0 +1,19 @@
+# Railway deployment config.
+# Persistent volume mounted at /app/data so the auth users.json + encrypted
+# api-keys.enc.json survive container restarts (Railway's filesystem is
+# otherwise ephemeral, same as Vercel).
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# A 1 GB volume is wildly overkill for a JSON store but it's the smallest
+# Railway offers and costs ~$0.25/mo. Mount path matches process.cwd()/data
+# in the Next.js app code (app/lib/auth/db.ts + app/lib/keys/vault.ts).
+[[deploy.volumes]]
+mountPath = "/app/data"
+name = "slotforge-data"
