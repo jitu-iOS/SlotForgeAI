@@ -67,8 +67,12 @@ export interface Asset {
   prompt: string;
   imageUrl: string;
   selected: boolean;
+  /** When true (default), download PNG preserves alpha transparency. */
+  transparentBg?: boolean;
   /** Set when the primary provider failed and a free fallback rendered the image. */
   usedFallback?: string;
+  /** Set when this individual asset's generation failed mid-stream. UI shows inline retry. */
+  error?: { message: string; code?: string };
 }
 
 export interface GenerateResponse {

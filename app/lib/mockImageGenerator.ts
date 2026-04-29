@@ -166,12 +166,17 @@ export async function generateMockImages(
 
 async function generateGPTImage(client: OpenAI, asset: Asset, styleDNA: StyleDNA): Promise<Asset> {
   try {
-    const res = await client.images.generate({
+    const useTransparent = asset.transparentBg !== false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const generateFn = client.images.generate as unknown as (opts: Record<string, unknown>) => Promise<{ data?: Array<{ b64_json?: string }> }>;
+    const res = await generateFn({
       model: "gpt-image-1",
       prompt: asset.prompt,
       size: "1024x1024",
       quality: "high",
       n: 1,
+      // background: "transparent" gives a real RGBA PNG with alpha channel
+      background: useTransparent ? "transparent" : "opaque",
     });
     const b64 = res.data?.[0]?.b64_json;
     if (!b64) throw new Error("Empty response from gpt-image-1");

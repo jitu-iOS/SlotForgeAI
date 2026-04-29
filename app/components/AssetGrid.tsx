@@ -13,6 +13,7 @@ export interface AssetGridProps {
   onSelectAll: (ids: string[], value: boolean) => void;
   onRegenerate: (id: string) => void;
   onEditAsset: (id: string, instruction: string) => void;
+  onToggleTransparentBg: (id: string, value: boolean) => void;
   regeneratingIds?: string[];
 }
 
@@ -51,7 +52,7 @@ const QUICK_ACTIONS = [
 
 export default function AssetGrid({
   assets, onToggleSelect, onSelectAll, onRegenerate, onEditAsset,
-  regeneratingIds = [],
+  onToggleTransparentBg, regeneratingIds = [],
 }: AssetGridProps) {
   const [filter, setFilter] = useState<FilterTab>("all");
   const [editTarget, setEditTarget] = useState<Asset | null>(null);
@@ -130,6 +131,7 @@ export default function AssetGrid({
                       onRegenerate={onRegenerate}
                       onOpenEdit={(a) => setEditTarget(a)}
                       onPreview={(a) => setPreviewAsset(a)}
+                      onToggleTransparentBg={onToggleTransparentBg}
                     />
                   ))}
                 </div>
@@ -162,7 +164,7 @@ export default function AssetGrid({
 // ---------------------------------------------------------------------------
 
 function AssetCard({
-  asset, isRegenerating, onToggleSelect, onRegenerate, onOpenEdit, onPreview,
+  asset, isRegenerating, onToggleSelect, onRegenerate, onOpenEdit, onPreview, onToggleTransparentBg,
 }: {
   asset: Asset;
   isRegenerating: boolean;
@@ -170,6 +172,7 @@ function AssetCard({
   onRegenerate: (id: string) => void;
   onOpenEdit: (asset: Asset) => void;
   onPreview: (asset: Asset) => void;
+  onToggleTransparentBg: (id: string, value: boolean) => void;
 }) {
   const [showPrompt, setShowPrompt] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -272,25 +275,81 @@ function AssetCard({
         )}
       </div>
 
-      {/* Footer: label + AI Edit button */}
-      <div className="flex items-center justify-between px-2.5 py-2 bg-[#111118] border-t border-white/[0.06] gap-2">
-        <div className="min-w-0 flex-1">
-          <p className="text-xs font-medium text-zinc-300 truncate">{asset.label}</p>
-          {asset.usedFallback && (
-            <p className="text-[10px] text-emerald-300/80 truncate" title={`Generated via ${asset.usedFallback} (free fallback)`}>
-              via {asset.usedFallback} · free
-            </p>
-          )}
+      {/* Footer: label + controls */}
+      <div className="flex flex-col bg-[#111118] border-t border-white/[0.06]">
+        {/* Row 1: label + AI Edit */}
+        <div className="flex items-center justify-between px-2.5 pt-2 pb-1 gap-2">
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-medium text-zinc-300 truncate">{asset.label}</p>
+            {asset.usedFallback && (
+              <p className="text-[10px] text-emerald-300/80 truncate" title={`Generated via ${asset.usedFallback} (free fallback)`}>
+                via {asset.usedFallback} · free
+              </p>
+            )}
+          </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); if (!isRegenerating) onOpenEdit(asset); }}
+            disabled={isRegenerating}
+            className="flex-shrink-0 flex items-center gap-1 rounded-lg bg-indigo-600/15 hover:bg-indigo-600/30 border border-indigo-500/20 hover:border-indigo-500/40 px-2 py-1 text-[10px] font-semibold text-indigo-400 hover:text-indigo-300 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Edit with AI"
+          >
+            <SparkleIcon />
+            AI Edit
+          </button>
         </div>
-        <button
-          onClick={(e) => { e.stopPropagation(); if (!isRegenerating) onOpenEdit(asset); }}
-          disabled={isRegenerating}
-          className="flex-shrink-0 flex items-center gap-1 rounded-lg bg-indigo-600/15 hover:bg-indigo-600/30 border border-indigo-500/20 hover:border-indigo-500/40 px-2 py-1 text-[10px] font-semibold text-indigo-400 hover:text-indigo-300 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-          title="Edit with AI"
+
+        {/* Row 2: transparent background checkbox */}
+        <label
+          className="flex items-center gap-2 px-2.5 pb-2 cursor-pointer group select-none"
+          title="When checked, PNG is downloaded with a transparent background"
+          onClick={(e) => e.stopPropagation()}
         >
-          <SparkleIcon />
-          AI Edit
-        </button>
+          <div className="relative flex-shrink-0">
+            <input
+              type="checkbox"
+              checked={asset.transparentBg !== false}
+              onChange={(e) => onToggleTransparentBg(asset.id, e.target.checked)}
+              disabled={isRegenerating}
+              className="peer sr-only"
+            />
+            {/* Custom checkbox — transparent bg (checkerboard) style */}
+            <div className={`w-3.5 h-3.5 rounded-[3px] border transition-all ${
+              asset.transparentBg !== false
+                ? "border-indigo-400/60 bg-indigo-600/25"
+                : "border-white/20 bg-transparent"
+            }`}
+              style={asset.transparentBg !== false ? {} : {
+                backgroundImage: "linear-gradient(45deg,rgba(255,255,255,0.07) 25%,transparent 25%,transparent 75%,rgba(255,255,255,0.07) 75%),linear-gradient(45deg,rgba(255,255,255,0.07) 25%,transparent 25%,transparent 75%,rgba(255,255,255,0.07) 75%)",
+                backgroundSize: "4px 4px",
+                backgroundPosition: "0 0,2px 2px",
+              }}
+            >
+              {asset.transparentBg !== false && (
+                <svg className="w-3.5 h-3.5 text-indigo-300" viewBox="0 0 12 12" fill="none">
+                  <polyline points="2,6 5,9 10,3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+              )}
+            </div>
+          </div>
+          <span className={`text-[10px] font-medium transition-colors ${
+            asset.transparentBg !== false ? "text-indigo-300" : "text-zinc-600"
+          }`}>
+            Transparent BG
+          </span>
+          {/* Checkerboard badge when checked — visual cue */}
+          {asset.transparentBg !== false && (
+            <span
+              className="ml-auto w-4 h-4 rounded-sm flex-shrink-0 border border-white/15"
+              style={{
+                backgroundImage: "linear-gradient(45deg,#555 25%,transparent 25%,transparent 75%,#555 75%),linear-gradient(45deg,#555 25%,transparent 25%,transparent 75%,#555 75%)",
+                backgroundSize: "4px 4px",
+                backgroundPosition: "0 0,2px 2px",
+                backgroundColor: "#888",
+              }}
+              title="Transparent PNG"
+            />
+          )}
+        </label>
       </div>
     </div>
   );

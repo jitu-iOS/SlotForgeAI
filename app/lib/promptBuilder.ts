@@ -158,6 +158,7 @@ function buildAssetStubs(types: AssetType[]): Asset[] {
         prompt: "",
         imageUrl: "",
         selected: false,
+        transparentBg: true,
       });
     }
   }
@@ -304,7 +305,7 @@ export async function rebuildSingleAsset(
   label: string,
   id: string
 ): Promise<Asset> {
-  const stub: Asset = { id, type, label, prompt: "", imageUrl: "", selected: false };
+  const stub: Asset = { id, type, label, prompt: "", imageUrl: "", selected: false, transparentBg: true };
   const client = await getClient();
 
   if (!client) {

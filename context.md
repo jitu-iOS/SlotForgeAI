@@ -1806,3 +1806,106 @@ Fix: Replaced `toasts.poweredBy()` with `toasts.push({ sticky: true, key: "gener
 
 ### Pending
 - #56 Smoke-test build wizard flows (utility-app + board-game) end-to-end
+
+---
+
+## 2026-04-29 · Phase 6 — Pre-generation Machine Preview (no-token)
+
+### Why
+Today every "Generate Assets" click costs real GPT-Image-1 / FLUX tokens (~$0.19–$0.06 per image × 10–20 assets = $2–4 per attempt). Users routinely submit before they can tell if their styleDNA direction will look right. By the time the assets stream back, money is already burned.
+
+The fix: an instant, **zero-token** machine prototype that renders directly from the form fields the user has typed. The preview is composed client-side from CSS gradients, theme-keyword-mapped emoji symbols, and a generated palette — no API calls. If the user likes what they see, they hit Generate Assets and now know the direction is right. If they don't like it, they edit the form (free) or open the optimization modal and refine the master prompt (also free until they explicitly click "Polish with AI").
+
+This is the architectural commitment: **the gate before paid generation must itself be free**.
+
+### User-visible behaviour
+1. **"👁️ Preview" button** appears next to "Generate Assets →" — only when the same `isValid` gate passes (gameName + theme + at least one asset type).
+2. Click Preview → a high-end mock slot machine renders inline below the form, using:
+   - Theme-keyword-mapped symbols (Egyptian → 𓂀 𓆣 ☥ 👑 💎; Treasure → 💰 💎 👑 🏆 ⭐; Fantasy → 🐉 ⚔️ 🛡️ 🧙 🔮; Sci-fi → 🚀 🛸 🪐 🤖 ⭐; Generic → 7️⃣ 💎 BAR 🔔 🍒)
+   - styleDNA palette derived from `colorPalette` field (parsed for color words / hex / fallback to amber+indigo gradient)
+   - Animated reels, mock paylines, ornate spin button, win counter, balance display
+   - Title plate using `gameName`
+3. Snapshot **persists in IndexedDB** as part of the project — survives reload until "New Project" or page reload.
+4. **Double-click the preview** → modal opens with:
+   - Larger machine view
+   - Auto-derived "Master Prompt" textarea pre-filled with the composite styleDNA description
+   - "Save Optimization" button (free) — persists user-edited prompt
+   - Optional "✨ Polish with AI" button → calls `/api/preview-machine` (paid; explicit opt-in) and returns a photoreal composite that replaces the SVG mock
+5. **Generate Assets** uses the saved `optimizedPrompt` (if present) as the master directive — prepended to styleDNA so every per-asset prompt aligns to the look the user approved.
+6. On the results view, the saved preview snapshot remains visible as a reference card so the user can compare prototype vs real.
+
+### Architecture
+
+#### Type changes (`app/types/index.ts`)
+```typescript
+export interface PreviewSnapshot {
+  capturedAt: string;
+  derivedDNA: { palette: string[]; mood: string; symbols: string[]; titleColor: string };
+  optimizedPrompt?: string;   // user's manually-edited / AI-polished master prompt
+  polishedImageUrl?: string;  // set if user clicked "Polish with AI"
+}
+export interface SavedProject {
+  // ... existing fields
+  previewSnapshot?: PreviewSnapshot;
+}
+```
+
+#### New files
+- `app/lib/themeSymbols.ts` — `getSymbolsForTheme(themeText) → string[]` keyword map
+- `app/lib/derivePreviewDNA.ts` — `derivePreviewDNA(form) → { palette, mood, symbols, titleColor }` pure client-side derivation
+- `app/components/MachinePreviewComposite.tsx` — the SVG/CSS composite (no API, instant)
+- `app/components/MachinePreviewModal.tsx` — full-screen popup with optimization textarea + AI polish button
+
+#### Modified files
+- `app/components/ProjectForm.tsx` — Preview button next to submit; calls `onPreview` prop
+- `app/project/page.tsx` — `previewSnapshot` state, modal wiring, persist to IndexedDB, render on results, thread `optimizedPrompt` to `/api/generate`
+- `app/api/generate/route.ts` — accept optional `optimizedPrompt` in body
+- `app/lib/promptBuilder.ts` — `buildStyleDNA` accepts `optimizedPrompt` and injects into `mood` so it propagates to every per-asset prompt downstream
+
+### Key design decisions
+- **Zero-token by default.** The composite is pure SVG/CSS/emoji. AI polish is opt-in.
+- **Symbol mapping is keyword-based, not AI.** Cheap, deterministic, instant. Five theme buckets (treasure / Egyptian / fantasy / sci-fi / generic) cover ~85% of slot themes. Misses fall back to generic.
+- **Optimization persists at project level**, not session. Reload-safe via IndexedDB (already present).
+- **Master prompt injection point is `buildStyleDNA`**, not per-asset prompt. This keeps consistency: one optimization → reflected in every asset prompt automatically.
+- **Modal opens on double-click** (per user request). Single click = no-op so users can read the preview without accidentally opening the modal.
+
+### Tasks
+- #103 Add PreviewSnapshot type + thread through SavedProject
+- #104 Build themeSymbols.ts (keyword → emoji symbols map)
+- #105 Build derivePreviewDNA.ts (form → DNA without API)
+- #106 Build MachinePreviewComposite.tsx (zero-token SVG/CSS mock)
+- #107 Build MachinePreviewModal.tsx with optimization textarea + opt-in AI polish
+- #108 Wire Preview button into ProjectForm; render composite inline on click
+- #109 Persist snapshot via IndexedDB; thread optimizedPrompt to /api/generate; show on results
+- #110 Smoke-test full flow: fill form → preview → optimize → generate → verify alignment
+
+---
+
+## 2026-04-29 · Phase 8 — Resilient streaming + visible failures
+
+### Bug
+On the asset generation page, after 1–3 minutes the UI appears stuck — only one or two images render, the rest stay as skeleton spinners forever, no error visible.
+
+### Root cause (two compounding bugs)
+1. **Server `/api/generate/route.ts:66-77`** uses `Promise.all` per batch of 3. When one image fails (quota tipping over mid-stream, content policy, network blip), `Promise.all` rejects → outer try/catch fires → ONE generic `error` event is sent → stream closes. The other 2 successful images in that batch are never emitted, and subsequent batches never run. From the client's perspective, generation just stops.
+2. **Client `page.tsx:740-769`** handles the `error` event by calling `setError + setStep("form")` — but the user is sitting on the results page with skeleton spinners. The form view is hidden, so the error message is invisible. The skeletons stay forever because `regenIds` is never cleared on the failure path.
+
+### Fix design
+**Server:**
+- Switch to `Promise.allSettled` per batch so ONE image failure does not lose the rest.
+- Emit a new `asset_error` SSE event per failed image: `{ type: "asset_error", id, label, message, code }`. Stream continues.
+- Track consecutive batch failures: if 2 batches in a row produce ZERO successes, or any image returns `auth_failed` / `quota_exhausted`, emit `fatal` event with the reason and stop. (Continuing past quota would just burn 10 more failures.)
+- Keep the existing `error` event semantics for pre-stream failures (prompt build, validation).
+
+**Client:**
+- Handle `asset_error`: remove the id from `regenIds`, mark the asset with an `error` field, show inline failure UI on the card with a retry button.
+- Handle `fatal`: show a prominent **alert modal** (not a quiet toast) naming the model, reason, count of completed/failed, and offering: Retry with current model · Retry with free fallback · Cancel.
+- On any stream end (success, error, fatal, abort): defensive `setRegenIds(new Set())` so no skeleton stays stuck.
+- Stall watchdog: if no event for 75s, show "Generation stalled" alert with manual retry. Resets on every event.
+
+### Tasks
+- #116 Add `error?: string` to Asset type + new `asset_error` / `fatal` SSE event types
+- #117 Switch `/api/generate` to Promise.allSettled + per-asset error emission + fatal-on-quota stop
+- #118 Build `GenerationAlertModal.tsx` (prominent modal with retry options)
+- #119 Wire client: handle asset_error, fatal events, defensive regenIds clear, stall watchdog
+- #120 Render inline failure UI + retry button on failed asset cards in AssetGrid

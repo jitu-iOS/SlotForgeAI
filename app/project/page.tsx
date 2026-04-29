@@ -9,6 +9,7 @@ import { downloadSelectedAssets } from "@/app/lib/downloadAssets";
 import { loadProjects, saveProject, deleteProject } from "@/app/lib/projectStorage";
 import { assetCacheUrl } from "@/app/lib/assetCache";
 import SlotMachinePreview from "@/app/components/SlotMachinePreview";
+import SlotVideoPreview from "@/app/components/SlotVideoPreview";
 import ApiKeysPanel from "@/app/components/ApiKeysPanel";
 import RoleStatusStrip from "@/app/components/RoleStatusStrip";
 import RoleSelectorModal from "@/app/components/RoleSelectorModal";
@@ -32,6 +33,7 @@ import {
   unmarkBuiltInRemoved,
 } from "@/app/lib/userModels";
 import RemoveModelConfirmModal from "@/app/components/RemoveModelConfirmModal";
+import GenerationAlertModal, { type GenerationAlertCode } from "@/app/components/GenerationAlertModal";
 import type { ProjectForm, GenerateResponse, Asset, ImageModel, SavedProject, SlotType, StyleDNA } from "@/app/types";
 import { nanoid } from "@/app/lib/nanoid";
 import { SLOT_TYPES, DEFAULT_SLOT_TYPE, getSlotConfig } from "@/app/lib/slotTypeConfig";
@@ -164,6 +166,27 @@ const FEATURE_CARDS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Helpers — surface server error reasons to the user with friendly phrasing
+// ---------------------------------------------------------------------------
+
+function classifyMessage(msg: string): GenerationAlertCode {
+  const m = (msg || "").toLowerCase();
+  if (m.includes("insufficient_quota") || m.includes("quota") || m.includes("billing")) return "quota_exhausted";
+  if (m.includes("401") || m.includes("403") || (m.includes("invalid") && m.includes("api"))) return "auth_failed";
+  if (m.includes("429") || m.includes("rate")) return "rate_limited";
+  if (m.includes("fetch") || m.includes("network") || m.includes("timeout")) return "network_error";
+  return "other_failure";
+}
+
+function shortReason(msg: string, code: string): string {
+  if (code === "quota_exhausted") return "Out of credits — top up to continue.";
+  if (code === "auth_failed")     return "API key rejected — check your key.";
+  if (code === "rate_limited")    return "Rate-limited — provider is throttling us.";
+  if (code === "network_error")   return "Network error reaching the provider.";
+  return (msg || "Image failed").replace(/^.*?: /, "").slice(0, 120);
+}
+
+// ---------------------------------------------------------------------------
 // Main Page
 // ---------------------------------------------------------------------------
 
@@ -210,7 +233,17 @@ export default function ProjectPage() {
   const [showHiddenBuiltIns, setShowHiddenBuiltIns]   = useState(false);
   const [pendingRemove, setPendingRemove]             = useState<ModelOption | null>(null);
   const [usageOpen, setUsageOpen]                     = useState(false);
+  const [genAlert, setGenAlert]                       = useState<null | {
+    code: GenerationAlertCode;
+    reason: string;
+    completed: number;
+    failed: number;
+    total: number;
+    formAtFailure: ProjectForm;
+    modelAtFailure: string;
+  }>(null);
   const retriedOnceRef = useRef(false);
+  const stallTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fillAllToastIdRef = useRef<string | null>(null);
 
   // Hydrate user-added + removed-built-in ids on mount
@@ -261,7 +294,7 @@ export default function ProjectPage() {
     [rawModelOptions]
   );
 
-  const { modelHealthMap } = useModelHealth({
+  const { modelHealthMap, lastCheckedAt } = useModelHealth({
     models: modelHealthInputs,
     selectedImageModel: selectedModel,
     selectedAnimationModel,
@@ -658,7 +691,28 @@ export default function ProjectPage() {
     // overwrites the same record instead of creating duplicates.
     inFlightProjectIdRef.current = nanoid();
 
+    // Stall watchdog: every SSE event resets a 75s timer. If silence exceeds
+    // that, abort the request and surface a "stalled" alert so the user is
+    // never staring at frozen skeletons without explanation.
+    const armStall = () => {
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = setTimeout(() => {
+        abortRef.current?.abort();
+        setGenAlert({
+          code: "stalled",
+          reason: "No progress signal from the provider for 75 seconds.",
+          completed: 0, failed: 0, total: 0,
+          formAtFailure: form,
+          modelAtFailure: activeModel,
+        });
+      }, 75_000);
+    };
+    const disarmStall = () => {
+      if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
+    };
+
     try {
+      armStall();
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -680,9 +734,13 @@ export default function ProjectPage() {
       // incremental auto-save during streaming.
       let streamStyleDNA: StyleDNA | null = null;
 
+      // Track running counts so we can pass them into the fatal alert
+      let counts = { completed: 0, failed: 0, total: 0 };
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        armStall(); // any byte resets the watchdog
         buffer += decoder.decode(value, { stream: true });
         const parts = buffer.split("\n\n");
         buffer = parts.pop() ?? "";
@@ -693,15 +751,19 @@ export default function ProjectPage() {
 
           if (payload.type === "init") {
             streamStyleDNA = payload.styleDNA;
-            setResult({ styleDNA: payload.styleDNA, assets: payload.assets });
-            setAssets(payload.assets);
+            const initAssets = (payload.assets as Asset[]).map((a) => ({ ...a, transparentBg: a.transparentBg ?? true }));
+            counts = { completed: 0, failed: 0, total: initAssets.length };
+            setResult({ styleDNA: payload.styleDNA, assets: initAssets });
+            setAssets(initAssets);
             setRegenIds(new Set<string>(payload.assets.map((a: Asset) => a.id)));
             setStep("results");
           } else if (payload.type === "asset") {
+            counts = { ...counts, completed: counts.completed + 1 };
             setAssets((prev) => {
-              const updated = prev.map((a) => (a.id === payload.asset.id ? payload.asset : a));
-              // Auto-save: overwrite the in-flight project record on every
-              // asset arrival so partial generations survive a tab close.
+              const incoming = payload.asset as Asset;
+              const existing = prev.find((a) => a.id === incoming.id);
+              const merged = { ...incoming, transparentBg: existing?.transparentBg ?? incoming.transparentBg ?? true };
+              const updated = prev.map((a) => (a.id === merged.id ? merged : a));
               const pid = inFlightProjectIdRef.current;
               if (pid && streamStyleDNA) {
                 const project: SavedProject = {
@@ -722,22 +784,69 @@ export default function ProjectPage() {
               next.delete(payload.asset.id);
               return next;
             });
+          } else if (payload.type === "asset_error") {
+            // One asset failed, stream continues. Attach error to the stub so
+            // the AssetGrid can render an inline retry.
+            counts = { ...counts, failed: counts.failed + 1 };
+            const failedId    = payload.id    as string;
+            const failedLabel = payload.label as string;
+            const message     = payload.message as string;
+            const code        = payload.code    as string;
+            setAssets((prev) => prev.map((a) =>
+              a.id === failedId ? { ...a, error: { message, code } } : a
+            ));
+            setRegenIds((prev) => {
+              const next = new Set(prev);
+              next.delete(failedId);
+              return next;
+            });
+            toasts.push({
+              kind: "error",
+              key: `asset-error-${failedId}`,
+              title: `${failedLabel} failed`,
+              body: shortReason(message, code),
+            });
+          } else if (payload.type === "fatal") {
+            // Server is bailing — surface the prominent alert. Counts come from
+            // server so we trust them over the local running tally.
+            counts = {
+              completed: payload.completed ?? counts.completed,
+              failed:    payload.failed    ?? counts.failed,
+              total:     payload.total     ?? counts.total,
+            };
+            setGenAlert({
+              code: payload.code as GenerationAlertCode,
+              reason: payload.reason as string,
+              completed: counts.completed,
+              failed: counts.failed,
+              total: counts.total,
+              formAtFailure: form,
+              modelAtFailure: activeModel,
+            });
+            // Don't throw — let the stream close naturally so finally cleans up.
+          } else if (payload.type === "done") {
+            counts = {
+              completed: payload.completed ?? counts.completed,
+              failed:    payload.failed    ?? counts.failed,
+              total:     payload.total     ?? counts.total,
+            };
           } else if (payload.type === "error") {
             throw new Error(payload.message);
           }
         }
       }
-      setRegenIds(new Set());
-      retriedOnceRef.current = false; // reset on success
+      retriedOnceRef.current = false;
       toasts.clearByKey("generating-active");
     } catch (err) {
       toasts.clearByKey("generating-active");
-      if (err instanceof Error && err.name === "AbortError") return; // clean unmount/reload
+      if (err instanceof Error && err.name === "AbortError") {
+        // Stall watchdog already opened the alert; nothing else to do.
+        return;
+      }
 
       const msg = err instanceof Error ? err.message : "";
       const isQuota = msg.includes("quota") || msg.includes("429") || msg.includes("rate");
 
-      // Auto-failover: on quota/rate error, retry once with the next-best healthy model.
       if (isQuota && !retriedOnceRef.current) {
         const nextModel = effectiveModelOptions.find(
           (m) => m.kind === "image" && m.value !== selectedModel && (modelHealthMap[m.value]?.status === "healthy" || m.providerKey === "free")
@@ -757,14 +866,50 @@ export default function ProjectPage() {
         }
       }
       retriedOnceRef.current = false;
-      setError(err instanceof Error ? err.message : "Unknown error");
-      setStep("form");
+      // Show prominent alert on the results page (stay there) instead of
+      // silently bouncing back to the form.
+      setGenAlert({
+        code: classifyMessage(msg),
+        reason: msg || "Unknown error",
+        completed: 0, failed: 0, total: 0,
+        formAtFailure: form,
+        modelAtFailure: activeModel,
+      });
+    } finally {
+      disarmStall();
+      // Defensive: any stub still in regenIds at this point will never receive
+      // an asset event — clear so its skeleton doesn't spin forever.
+      setRegenIds(new Set());
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedModel, slotType, effectiveModelOptions, modelHealthMap]);
 
+  // Retry handlers wired into GenerationAlertModal CTAs
+  const handleAlertRetrySame = useCallback(() => {
+    const ctx = genAlert;
+    if (!ctx) return;
+    setGenAlert(null);
+    void handleSubmit(ctx.formAtFailure, ctx.modelAtFailure);
+  }, [genAlert, handleSubmit]);
+
+  const handleAlertRetryFailover = useCallback(() => {
+    const ctx = genAlert;
+    if (!ctx) return;
+    const nextModel = effectiveModelOptions.find(
+      (m) => m.kind === "image" && m.value !== ctx.modelAtFailure && (modelHealthMap[m.value]?.status === "healthy" || m.providerKey === "free")
+    );
+    if (!nextModel) return;
+    setGenAlert(null);
+    setSelectedModelRaw(nextModel.value);
+    void handleSubmit(ctx.formAtFailure, nextModel.value);
+  }, [genAlert, effectiveModelOptions, modelHealthMap, handleSubmit]);
+
   const handleToggleSelect = useCallback((id: string) => {
     setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, selected: !a.selected } : a)));
+  }, []);
+
+  const handleToggleTransparentBg = useCallback((id: string, value: boolean) => {
+    setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, transparentBg: value } : a)));
   }, []);
 
   const handleSelectAll = useCallback((ids: string[], value: boolean) => {
@@ -948,7 +1093,7 @@ export default function ProjectPage() {
         theme={theme}
         onSelectTheme={setTheme}
         quotaState={quotaState}
-        onNewProject={() => { setStep("form"); setError(null); }}
+        onNewProject={() => { handleReset(); setStep("form"); }}
         onGoHome={() => setStep("home")}
         onSlotPreview={() => setStep("slot_preview")}
         onGoResults={() => setStep("results")}
@@ -1022,6 +1167,32 @@ export default function ProjectPage() {
 
       {/* AI Usage Monitor panel — admin only */}
       <UsagePanel open={usageOpen} onClose={() => setUsageOpen(false)} />
+
+      {/* Prominent alert when generation hits a fatal/stalled state */}
+      {genAlert && (() => {
+        const opt = MODEL_OPTIONS.find((m) => m.value === genAlert.modelAtFailure);
+        const failover = effectiveModelOptions.find(
+          (m) => m.kind === "image" && m.value !== genAlert.modelAtFailure && (modelHealthMap[m.value]?.status === "healthy" || m.providerKey === "free")
+        );
+        const billingUrl = opt?.billingUrl;
+        return (
+          <GenerationAlertModal
+            open
+            modelLabel={opt?.label ?? genAlert.modelAtFailure}
+            providerLabel={opt?.provider ?? "AI provider"}
+            code={genAlert.code}
+            reason={genAlert.reason}
+            completed={genAlert.completed}
+            failed={genAlert.failed}
+            total={genAlert.total}
+            failoverLabel={failover?.label}
+            billingUrl={billingUrl}
+            onClose={() => setGenAlert(null)}
+            onRetrySame={handleAlertRetrySame}
+            onRetryFailover={failover ? handleAlertRetryFailover : undefined}
+          />
+        );
+      })()}
 
       {/* Remove-model confirm modal — fired from any × button (built-in or user-added). */}
       {pendingRemove && (
@@ -1125,7 +1296,7 @@ export default function ProjectPage() {
         <main className="flex-1 overflow-y-auto">
           {step === "home" && (
             <HomeView
-              onCreateProject={() => setStep("form")}
+              onCreateProject={() => { handleReset(); setStep("form"); }}
               selectedModel={selectedModel}
               providerStatus={providerStatus}
               quotaState={quotaState}
@@ -1142,11 +1313,12 @@ export default function ProjectPage() {
               onToggleShowHidden={() => setShowHiddenBuiltIns((v) => !v)}
               hasHidden={removedBuiltInIds.length > 0}
               modelHealthMap={modelHealthMap}
+              lastCheckedAt={lastCheckedAt}
             />
           )}
 
           {step === "slot_preview" && (
-            <SlotMachinePreview assets={assets} gameName={gameName || "SlotForge"} />
+            <SlotVideoPreview gameName={gameName || "SlotForge"} />
           )}
 
           {step === "form" && (
@@ -1247,6 +1419,7 @@ export default function ProjectPage() {
                 onSelectAll={handleSelectAll}
                 onRegenerate={handleRegenerate}
                 onEditAsset={handleEditAsset}
+                onToggleTransparentBg={handleToggleTransparentBg}
                 onDownload={handleDownload}
                 onSave={handleSave}
                 onReset={handleReset}
@@ -1348,12 +1521,6 @@ function Sidebar({
             <div className="text-[11px] text-zinc-500 tracking-[0.15em] uppercase mt-0.5">Slots Generator</div>
           </div>
         </div>
-        <button
-          onClick={onNewProject}
-          className="w-full flex items-center justify-center gap-2 rounded-xl bg-[image:linear-gradient(to_right,var(--accent-from),var(--accent-to))] hover:opacity-90 py-3 text-sm font-bold transition-all shadow-md shadow-indigo-900/40"
-        >
-          ✦ New Project
-        </button>
       </div>
 
       {/* Active project badge */}
@@ -1401,12 +1568,6 @@ function Sidebar({
               tip="Create users, assign roles, enable/disable accounts, reset passwords. Admin only."
             />
           )}
-          <NavItem
-            icon="📁" label="New Project" active={step === "form"}
-            onClick={onNewProject}
-            locked={isGenerating}
-            tip="Open the 9-section game brief form. Describe your theme, art direction, symbols, FX, and quality settings. AI can auto-fill every field."
-          />
         </nav>
 
         <SidebarDivider label="AI Tools" />
@@ -1954,6 +2115,7 @@ function HomeView({
   onToggleShowHidden,
   hasHidden,
   modelHealthMap,
+  lastCheckedAt,
 }: {
   onCreateProject: () => void;
   selectedModel: ImageModel;
@@ -1972,10 +2134,11 @@ function HomeView({
   onToggleShowHidden: () => void;
   hasHidden: boolean;
   modelHealthMap: Record<string, ModelHealth>;
+  lastCheckedAt: number | null;
 }) {
   return (
     <div className="px-10 py-10 max-w-6xl mx-auto w-full animate-fade-in">
-      <div className="flex items-start justify-between mb-10 gap-5">
+      <div className="flex items-start justify-between mb-10 gap-6">
         <div>
           <h1 className="text-4xl font-extrabold tracking-tight leading-tight">
             <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Get Started</span>{" "}
@@ -1985,12 +2148,9 @@ function HomeView({
             Build production-ready 2D slot game assets — symbols, backgrounds, UI, FX, animations, and a full slot machine preview.
           </p>
         </div>
-        <button
-          onClick={onCreateProject}
-          className="flex-shrink-0 flex items-center gap-2 rounded-xl bg-[image:linear-gradient(to_right,var(--accent-from),var(--accent-to))] hover:opacity-90 px-6 py-3.5 text-base font-bold transition-all shadow-lg shadow-indigo-900/40"
-        >
-          ✦ Create New Project
-        </button>
+
+        {/* Casino preview video — top-right corner, small looping window */}
+        <CasinoVideoWidget />
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-12">
@@ -2010,6 +2170,11 @@ function HomeView({
               {effectiveModelOptions.length} model{effectiveModelOptions.length === 1 ? "" : "s"} ·
               click any × to remove · search to add more
             </p>
+            <ModelHealthStatusLine
+              lastCheckedAt={lastCheckedAt}
+              healthMap={modelHealthMap}
+              modelIds={effectiveModelOptions.map((m) => m.value)}
+            />
           </div>
           <div className="flex items-center gap-2 w-full sm:w-auto">
             {hasHidden && (
@@ -2145,6 +2310,54 @@ function HomeView({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Casino Video Widget
+// ---------------------------------------------------------------------------
+
+function CasinoVideoWidget() {
+  return (
+    <div className="flex-shrink-0 relative group" style={{ width: 192, height: 108 }}>
+      {/* Animated amber/gold border glow */}
+      <div
+        className="absolute -inset-[2px] rounded-2xl z-0"
+        style={{
+          background: "linear-gradient(135deg, #f59e0b, #d97706, #b45309, #f59e0b)",
+          backgroundSize: "300% 300%",
+          animation: "casino-border-spin 3s linear infinite",
+          opacity: 0.85,
+        }}
+      />
+      {/* Inner frame */}
+      <div className="relative z-10 w-full h-full rounded-[14px] overflow-hidden bg-black shadow-[0_0_28px_rgba(245,158,11,0.55)]">
+        {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+        <video
+          src="/animation.mp4"
+          autoPlay
+          loop
+          muted
+          playsInline
+          className="w-full h-full object-cover"
+        />
+        {/* Subtle vignette overlay for depth */}
+        <div className="absolute inset-0 pointer-events-none rounded-[14px]"
+          style={{ boxShadow: "inset 0 0 18px rgba(0,0,0,0.55)" }} />
+        {/* LIVE badge */}
+        <div className="absolute top-1.5 left-1.5 flex items-center gap-1 bg-black/60 backdrop-blur-sm rounded-full px-1.5 py-0.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+          <span className="text-[8px] font-bold tracking-widest text-white/80 uppercase">Live</span>
+        </div>
+        {/* 🎰 label */}
+        <div className="absolute bottom-1.5 right-1.5 text-[10px] opacity-60 select-none">🎰</div>
+      </div>
+      {/* Reflection/glow beneath */}
+      <div
+        className="absolute left-2 right-2 bottom-[-10px] h-3 rounded-full blur-md opacity-50 z-0"
+        style={{ background: "linear-gradient(to right, #f59e0b, #d97706)" }}
+      />
+    </div>
+  );
+}
+
 function FeatureCard({ card, onCreateProject }: { card: (typeof FEATURE_CARDS)[0]; onCreateProject: () => void }) {
   return (
     <div
@@ -2204,7 +2417,7 @@ function ResultsView({
   result, assets, regeneratingIds, regenError,
   isDownloading, downloadDone, isSaved, isGenerating, pendingAutoSave,
   onDismissRegenError, onToggleSelect, onSelectAll,
-  onRegenerate, onEditAsset, onDownload, onSave, onReset,
+  onRegenerate, onEditAsset, onToggleTransparentBg, onDownload, onSave, onReset,
 }: {
   result: GenerateResponse;
   assets: Asset[];
@@ -2220,6 +2433,7 @@ function ResultsView({
   onSelectAll: (ids: string[], value: boolean) => void;
   onRegenerate: (id: string) => void;
   onEditAsset: (id: string, instruction: string) => void;
+  onToggleTransparentBg: (id: string, value: boolean) => void;
   onDownload: () => void;
   onSave: () => void;
   onReset: () => void;
@@ -2246,7 +2460,7 @@ function ResultsView({
       )}
 
       <StyleDNACard dna={result.styleDNA} />
-      <AssetGrid assets={assets} regeneratingIds={regeneratingIds} onToggleSelect={onToggleSelect} onSelectAll={onSelectAll} onRegenerate={onRegenerate} onEditAsset={onEditAsset} />
+      <AssetGrid assets={assets} regeneratingIds={regeneratingIds} onToggleSelect={onToggleSelect} onSelectAll={onSelectAll} onRegenerate={onRegenerate} onEditAsset={onEditAsset} onToggleTransparentBg={onToggleTransparentBg} />
 
       {/* Footer actions */}
       <div className="flex items-center justify-between pt-2 border-t border-white/10 gap-3">
@@ -2388,6 +2602,81 @@ function ActivationBadge({ status }: { status: ModelStatus }) {
 
 // Health status pill — rendered on model cards from the 30s watchdog data.
 // Only shows statuses that add information not already in ActivationBadge.
+// Live status line under "AI Models Available" — driven by the same 30s
+// watchdog poll that powers the per-model health pills. Re-renders every
+// second so the "Xs ago" counter stays fresh between polls.
+function ModelHealthStatusLine({
+  lastCheckedAt, healthMap, modelIds,
+}: {
+  lastCheckedAt: number | null;
+  healthMap: Record<string, ModelHealth>;
+  modelIds: string[];
+}) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((v) => v + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  void tick;
+
+  // Aggregate health across the rendered models
+  let healthy = 0, attention = 0, dead = 0;
+  for (const id of modelIds) {
+    const s = healthMap[id]?.status;
+    if (s === "healthy" || s === "active") healthy++;
+    else if (s === "quota-out" || s === "stale" || s === "not-relevant") dead++;
+    else attention++;
+  }
+
+  const ageSec = lastCheckedAt ? Math.max(0, Math.round((Date.now() - lastCheckedAt) / 1000)) : null;
+  const ageLabel =
+    ageSec === null         ? "syncing…" :
+    ageSec < 5              ? "just now" :
+    ageSec < 60             ? `${ageSec}s ago` :
+    ageSec < 3600           ? `${Math.round(ageSec / 60)}m ago` :
+                              `${Math.round(ageSec / 3600)}h ago`;
+
+  // Traffic-light dot. If we have any dead models → amber/red, else green.
+  // Stale (no check yet, or check older than 90s) → gray.
+  const dotState =
+    ageSec === null || ageSec > 90 ? "stale" :
+    dead > 0                       ? "red"   :
+    attention > 0                  ? "amber" :
+                                     "green";
+  const dotCls =
+    dotState === "green" ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.7)]" :
+    dotState === "amber" ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.7)]"  :
+    dotState === "red"   ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.8)] animate-pulse" :
+                           "bg-zinc-600";
+  const labelCls =
+    dotState === "green" ? "text-emerald-300" :
+    dotState === "amber" ? "text-amber-300"   :
+    dotState === "red"   ? "text-rose-300"    :
+                           "text-zinc-500";
+  const summary =
+    dotState === "stale" ? "Awaiting first check" :
+    dotState === "green" ? "All systems healthy"  :
+    dotState === "amber" ? `${attention} need attention` :
+                           `${dead} ${dead === 1 ? "model" : "models"} down`;
+
+  return (
+    <div className="flex items-center gap-2 mt-2 text-[10px] tabular-nums" title="Auto-refreshes every 30s via /api/usage">
+      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotCls}`} />
+      <span className={`font-bold uppercase tracking-[0.14em] ${labelCls}`}>
+        {summary}
+      </span>
+      <span className="text-zinc-600">·</span>
+      <span className="text-zinc-500">
+        {healthy} healthy · {attention} pending · {dead} down
+      </span>
+      <span className="text-zinc-600">·</span>
+      <span className="text-zinc-500">
+        last health check <span className="text-zinc-400">{ageLabel}</span>
+      </span>
+    </div>
+  );
+}
+
 function HealthBadge({ health }: { health: ModelHealth }) {
   if (health.status === "healthy") {
     return (

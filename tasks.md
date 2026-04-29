@@ -99,3 +99,66 @@ Changes to `app/project/page.tsx`:
 ## Pending
 
 - #56 Smoke-test build wizard flows (utility-app + board-game) end-to-end
+
+---
+
+## Phase 6 — Pre-generation Machine Preview (2026-04-29)
+
+### Goal
+Stop one step before paid asset generation. Render a zero-token, themed slot machine mock so the user can validate styleDNA direction before burning tokens. Adds a "Preview" button next to "Generate Assets", an inline mock composite, and a double-click modal with embedded prompt-optimization textarea (free) + opt-in AI polish (paid).
+
+### Tasks
+- #103 Add PreviewSnapshot type + thread through SavedProject
+- #104 Build themeSymbols.ts (keyword → emoji symbols map)
+- #105 Build derivePreviewDNA.ts (form → DNA without API)
+- #106 Build MachinePreviewComposite.tsx (zero-token SVG/CSS mock)
+- #107 Build MachinePreviewModal.tsx with optimization textarea + opt-in AI polish
+- #108 Wire Preview button into ProjectForm; render composite inline on click
+- #109 Persist snapshot via IndexedDB; thread optimizedPrompt to /api/generate; show on results
+- #110 Smoke-test full flow: fill form → preview → optimize → generate → verify alignment
+
+### Mid-task addition (#111)
+- #111 Build PreviewBuildingLoader.tsx — cinematic loader for both the brief mock-render moment (~900ms) and the AI Polish wait (~10s). Assembling reels animation, sparkle particles, rotating sub-messages, theme-tinted accent colors, shimmer-text headline, fill-bar progress.
+
+### What shipped (Phase 6)
+- `app/types/index.ts` — `PreviewSnapshot` interface + optional field on `SavedProject`
+- `app/lib/themeSymbols.ts` — 8 theme buckets (egyptian/treasure/fantasy/scifi/ocean/asian/horror/generic) → emoji symbol sets + bucket-default palette
+- `app/lib/derivePreviewDNA.ts` — `derivePreviewDNA(form)` + `buildMasterPromptFromForm(form)`. Pure client-side, no API
+- `app/components/MachinePreviewComposite.tsx` — zero-token slot machine mock (frame, 3×5 reels, paylines, spin button, balance/bet/win UI). Compact + full sizes
+- `app/components/MachinePreviewModal.tsx` — fullscreen modal with composite + master prompt textarea + Save Optimisation (free) + Polish with AI (paid, opt-in)
+- `app/components/PreviewBuildingLoader.tsx` — cinematic loader with assembling reels, sparkle particles, shimmer text, rotating sub-messages
+- `app/globals.css` — 5 new keyframes (sparkle-float, shimmer-text, loader-fill-fast/slow, reel-assemble, line-fade)
+- `app/components/ProjectForm.tsx` — Preview button (visible only when isValid) calling `onPreview`
+- `app/project/page.tsx` — `previewSnapshot` + `previewModalOpen` + `previewBuilding` state, handlers (handlePreview/handleSaveOptimization/handlePolished), inline composite below form, modal mount, snapshot card on results, persists in IndexedDB via SavedProject, restores on project load, clears on handleReset
+- `app/api/generate/route.ts` — accepts `optimizedPrompt` in body, threads to buildStyleDNA + buildPrompts
+- `app/lib/promptBuilder.ts` — `buildStyleDNA` accepts `optimizedPrompt`, injects via `injectOptimization()` into the `mood` field so every per-asset prompt downstream picks it up automatically
+
+---
+
+## Phase 7 — Diversity & fresh-project hygiene (2026-04-29)
+
+### Why
+Two tightly-related complaints:
+1. AI Fill All produced the same Egyptian/treasure brief on every empty form because GPT-4o-mini at default temperature collapses to its most-likely output.
+2. Sidebar "New Project" / "Asset Generator" / "AI Prompt Assist" only changed `step`, leaving stale `result`, `assets`, `submittedForm`, `previewSnapshot` behind — so navigation didn't feel like starting over.
+
+### Tasks
+- #112 Build innovativeSlotSeeds.ts — 50+ trending 2026 slot directions
+- #113 Inject diversity + temperature into /api/suggest-all
+- #114 Apply diversity logic to single-field /api/suggest
+- #115 Wire all "New Project" entrypoints to handleReset() (full clear)
+
+### What shipped
+- `app/lib/innovativeSlotSeeds.ts` — 50+ curated seeds (cosmic yakuza, bio-neon coral reef, quantum mariachi, afrofuturist pharaoh, cottagecore necromancer, …) + `pickInnovativeSeed()` + `ANTI_CLICHE_GUARD` constant
+- `app/api/suggest-all/route.ts`:
+  - Detects sparseness (≤1 of theme/gameName/targetAudience/artStyle filled)
+  - Sparse: temperature 1.05, inject one creative seed, anti-cliché guard, request_nonce
+  - Rich: temperature 0.7, no seed, "align tightly to user's choices"
+- `app/api/suggest/route.ts` — same dual-mode logic for single-field ✦
+- `app/project/page.tsx` — `onNewProject` and `onCreateProject` now call `handleReset()` before `setStep("form")`, clearing result/assets/submittedForm/previewSnapshot/etc.
+
+### Behaviour
+- Empty Fill All on visit 1 → Cosmic Yakuza brief
+- Empty Fill All on visit 2 → Cottagecore Necromancer brief
+- Empty Fill All on visit 3 → Brazilian Carnaval Ascension brief
+- Partially filled (e.g. user typed "Norse mythology"): AI extends Norse coherently, no random seed

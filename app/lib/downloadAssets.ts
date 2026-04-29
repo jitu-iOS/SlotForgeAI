@@ -11,9 +11,12 @@ const TYPE_FOLDERS: Record<AssetType, string> = {
 };
 
 /**
- * Download all selected assets.
- * - 1 selected  → single PNG file download
- * - 2+ selected → ZIP containing PNGs in organised sub-folders
+ * Download all selected assets as PNGs.
+ * - 1 selected  → single PNG file
+ * - 2+ selected → ZIP with PNGs organised into sub-folders
+ * Respects each asset's `transparentBg` flag:
+ *   - true (default) → preserve alpha channel (transparent PNG)
+ *   - false          → composite onto white before saving
  */
 export async function downloadSelectedAssets(
   assets: Asset[],
@@ -24,9 +27,8 @@ export async function downloadSelectedAssets(
 
   const gameSlug = slugify(gameName || "slotforge");
 
-  // Convert all selected SVG data URLs → PNG blobs in parallel
   const blobs = await Promise.all(
-    selected.map((a) => svgDataUrlToPng(a.imageUrl))
+    selected.map((a) => imageUrlToPng(a.imageUrl, a.transparentBg !== false))
   );
 
   if (selected.length === 1) {
@@ -52,9 +54,17 @@ export async function downloadSelectedAssets(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function svgDataUrlToPng(dataUrl: string, size = 512): Promise<Blob> {
+/**
+ * Decode any image data URL (PNG, JPEG, SVG, base64) into a PNG Blob.
+ * transparent = true  → draw on a clear canvas → preserves alpha channel
+ * transparent = false → fill white first → opaque output
+ */
+function imageUrlToPng(dataUrl: string, transparent: boolean, size = 1024): Promise<Blob> {
   return new Promise((resolve, reject) => {
+    if (!dataUrl) { reject(new Error("Empty image URL")); return; }
+
     const img = new Image();
+    img.crossOrigin = "anonymous";
 
     img.onload = () => {
       const canvas = document.createElement("canvas");
@@ -62,6 +72,14 @@ function svgDataUrlToPng(dataUrl: string, size = 512): Promise<Blob> {
       canvas.height = size;
       const ctx = canvas.getContext("2d");
       if (!ctx) { reject(new Error("No 2d context")); return; }
+
+      if (!transparent) {
+        // Solid white background so the saved PNG has no alpha
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, size, size);
+      }
+      // ctx starts fully transparent by default — transparent PNGs keep their alpha
+
       ctx.drawImage(img, 0, 0, size, size);
       canvas.toBlob(
         (blob) => (blob ? resolve(blob) : reject(new Error("toBlob returned null"))),
@@ -69,7 +87,7 @@ function svgDataUrlToPng(dataUrl: string, size = 512): Promise<Blob> {
       );
     };
 
-    img.onerror = () => reject(new Error(`Failed to load image: ${dataUrl.slice(0, 40)}…`));
+    img.onerror = () => reject(new Error("Failed to load image"));
     img.src = dataUrl;
   });
 }
