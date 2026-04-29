@@ -278,6 +278,14 @@
   100% { transform: translateY(0); }
 }
 
+/* Trending AI Models banner — infinite horizontal scroll. The strip duplicates
+   its content twice so translating by exactly -50% lands on identical cells,
+   making the wrap-around invisible. Pause on hover via .pause-on-hover:hover. */
+@keyframes trending-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
 @theme inline {
   --animate-coin-fall:      coin-fall 2.4s linear forwards;
   --animate-payline-draw:   payline-draw 0.55s ease-out forwards;

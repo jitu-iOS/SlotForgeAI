@@ -3,6 +3,7 @@ import type { ProjectForm, StyleDNA, Asset, AssetType, SlotType } from "@/app/ty
 import { nanoid } from "@/app/lib/nanoid";
 import { getSlotConfig } from "@/app/lib/slotTypeConfig";
 import { getProviderKey } from "@/app/lib/keys/providerKey";
+import { resolvePromptModel } from "@/app/lib/aiRoles";
 
 // ---------------------------------------------------------------------------
 // Asset catalogue
@@ -71,13 +72,13 @@ async function getClient(): Promise<OpenAI | null> {
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function buildStyleDNA(form: ProjectForm, slotType?: SlotType): Promise<StyleDNA> {
+export async function buildStyleDNA(form: ProjectForm, slotType?: SlotType, promptModel?: string): Promise<StyleDNA> {
   const client = await getClient();
   if (!client) return buildStyleDNAFallback(form);
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: resolvePromptModel(promptModel),
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: STYLE_DNA_SYSTEM },
@@ -103,7 +104,8 @@ export async function buildStyleDNA(form: ProjectForm, slotType?: SlotType): Pro
 export async function buildPrompts(
   form: ProjectForm,
   styleDNA: StyleDNA,
-  slotType?: SlotType
+  slotType?: SlotType,
+  promptModel?: string,
 ): Promise<Asset[]> {
   const client = await getClient();
   const stubs = buildAssetStubs(form.assetTypes);
@@ -111,7 +113,7 @@ export async function buildPrompts(
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: resolvePromptModel(promptModel),
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: PROMPTS_SYSTEM },

@@ -1,15 +1,38 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import ProjectFormComponent from "@/app/components/ProjectForm";
 import StyleDNACard from "@/app/components/StyleDNACard";
 import AssetGrid from "@/app/components/AssetGrid";
 import { SkeletonStyleDNA, SkeletonGrid } from "@/app/components/SkeletonGrid";
 import { downloadSelectedAssets } from "@/app/lib/downloadAssets";
 import { loadProjects, saveProject, deleteProject } from "@/app/lib/projectStorage";
+import { assetCacheUrl } from "@/app/lib/assetCache";
 import SlotMachinePreview from "@/app/components/SlotMachinePreview";
 import ApiKeysPanel from "@/app/components/ApiKeysPanel";
-import type { ProjectForm, GenerateResponse, Asset, ImageModel, SavedProject, SlotType } from "@/app/types";
+import RoleStatusStrip from "@/app/components/RoleStatusStrip";
+import RoleSelectorModal from "@/app/components/RoleSelectorModal";
+import CollapsibleSection from "@/app/components/CollapsibleSection";
+import ModelSearch from "@/app/components/ModelSearch";
+import ModelCompatibilityModal from "@/app/components/ModelCompatibilityModal";
+import TrendingAIBanner from "@/app/components/TrendingAIBanner";
+import { useToasts } from "@/app/components/ToastCenter";
+import { useModelHealth } from "@/app/components/useModelHealth";
+import UsagePanel from "@/app/components/UsagePanel";
+import { type ModelHealth } from "@/app/lib/modelHealth";
+import type { AIRole } from "@/app/lib/aiRoles";
+import type { CatalogueEntry } from "@/app/lib/aiCatalogue";
+import { AI_CATALOGUE } from "@/app/lib/aiCatalogue";
+import {
+  addModel as addUserModel,
+  getAddedIds,
+  removeModel as removeUserModel,
+  getRemovedBuiltInIds,
+  markBuiltInRemoved,
+  unmarkBuiltInRemoved,
+} from "@/app/lib/userModels";
+import RemoveModelConfirmModal from "@/app/components/RemoveModelConfirmModal";
+import type { ProjectForm, GenerateResponse, Asset, ImageModel, SavedProject, SlotType, StyleDNA } from "@/app/types";
 import { nanoid } from "@/app/lib/nanoid";
 import { SLOT_TYPES, DEFAULT_SLOT_TYPE, getSlotConfig } from "@/app/lib/slotTypeConfig";
 
@@ -43,11 +66,48 @@ interface ModelOption {
   kind: ModelKind;
 }
 
-const OPENAI_BILLING     = "https://platform.openai.com/account/billing";
+// ── Verified billing destinations (researched 2026-04-29) ──────────────────
+// Each URL was checked to confirm it lands on the *exact* page where a
+// superadmin can pay AND get an API key — never a marketing or consumer page.
+// If any of these stops working, update the BILLING_DESTINATIONS map below
+// so the verification metadata stays in sync.
+const OPENAI_BILLING     = "https://platform.openai.com/settings/organization/billing/overview";
 const REPLICATE_BILLING  = "https://replicate.com/account/billing";
-const RUNWAY_BILLING     = "https://app.runwayml.com/account";
-const IMAGINEART_BILLING = "https://www.imagine.art/api";
+const RUNWAY_BILLING     = "https://dev.runwayml.com/";
+const IMAGINEART_BILLING = "https://platform.imagine.art/";
 const POLLINATIONS_INFO  = "https://pollinations.ai";
+
+// Per-provider destination metadata used by the Subscribe-confirm preview.
+// description = one-line preview shown to the user BEFORE the tab opens, so
+// they know what they'll see (avoids the runwayml.com → dev.runwayml.com
+// confusion the superadmin hit on 2026-04-28).
+const BILLING_DESTINATIONS: Record<ProviderKey, { url: string; description: string; verifiedAt: string }> = {
+  openai: {
+    url: OPENAI_BILLING,
+    description: "OpenAI billing overview — log in, add a payment method or top up credits, then create an API key from /api-keys.",
+    verifiedAt: "2026-04-29",
+  },
+  replicate: {
+    url: REPLICATE_BILLING,
+    description: "Replicate billing — pay-as-you-go credits. After adding a card, copy the API token from /account/api-tokens.",
+    verifiedAt: "2026-04-29",
+  },
+  runway: {
+    url: RUNWAY_BILLING,
+    description: "Runway DEVELOPER portal (dev.runwayml.com) — sign up for API access, buy credits, generate API key. NOT the consumer Gen-3 web app.",
+    verifiedAt: "2026-04-29",
+  },
+  imagineart: {
+    url: IMAGINEART_BILLING,
+    description: "Imagine Art / Vyro AI developer platform — log in, get 1500 free credits on signup, then upgrade for paid tier and get your vk- API key.",
+    verifiedAt: "2026-04-29",
+  },
+  free: {
+    url: POLLINATIONS_INFO,
+    description: "Pollinations is community-funded and free — no payment or API key required. Donate at pollinations.ai if you want to support them.",
+    verifiedAt: "2026-04-29",
+  },
+};
 
 // 4 image + 3 animation models, curated for premium slot art and motion.
 // Animation models produce short video clips usable for intros, ambient
@@ -65,6 +125,7 @@ const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 type ProviderStatus = Record<ProviderKey, { configured: boolean }>;
+type RoleHealthMap = Record<"prompt" | "image" | "animation", import("@/app/lib/aiRoles").RoleHealth>;
 type QuotaState = Partial<Record<ProviderKey, boolean>>; // true = exhausted/limit reached
 const QUOTA_STORAGE_KEY = "slotforge.quotaExhausted";
 const SUBSCRIBED_STORAGE_KEY = "slotforge.subscribedModels";
@@ -107,6 +168,7 @@ const FEATURE_CARDS = [
 // ---------------------------------------------------------------------------
 
 export default function ProjectPage() {
+  const toasts = useToasts();
   const [step, setStep]                   = useState<Step>("home");
   const [result, setResult]               = useState<GenerateResponse | null>(null);
   const [assets, setAssets]               = useState<Asset[]>([]);
@@ -117,10 +179,15 @@ export default function ProjectPage() {
   const [regenError, setRegenError]       = useState<string | null>(null);
   const [isDownloading, setDownloading]   = useState(false);
   const [downloadDone, setDownloadDone]   = useState(false);
-  const [selectedModel, setSelectedModel] = useState<ImageModel>("gpt-image-1");
+  // Three role selections — prompt assistant (text), image generation, and
+  // animation generation. Each persists to localStorage.
+  const [selectedModel, setSelectedModelRaw]                   = useState<ImageModel>("gpt-image-1");
+  const [selectedAnimationModel, setSelectedAnimationModelRaw] = useState<ImageModel>("runway-gen3");
+  const [selectedPromptModel, setSelectedPromptModelRaw]       = useState<string>("gpt-4o-mini");
   const [modelOpen, setModelOpen]         = useState(false);
   const [pendingModel, setPendingModel]   = useState<ImageModel | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [roleHealth, setRoleHealth]         = useState<RoleHealthMap | null>(null);
   const [quotaState, setQuotaState]       = useState<QuotaState>({});
   const [subscribedModels, setSubscribedModels] = useState<Set<ImageModel>>(new Set());
   const [theme, setTheme]                 = useState<Theme>(DEFAULT_THEME);
@@ -136,16 +203,205 @@ export default function ProjectPage() {
   const [apiKeysOpen, setApiKeysOpen]     = useState(false);
   const [currentRole, setCurrentRole]     = useState<"SUPER_ADMIN" | "ADMIN" | "USER" | null>(null);
   const [syncTick, setSyncTick]           = useState(0);
+  const [swapRole, setSwapRole]           = useState<AIRole | null>(null);
+  const [pickedCatalogueEntry, setPickedCatalogueEntry] = useState<CatalogueEntry | null>(null);
+  const [userAddedIds, setUserAddedIds]               = useState<string[]>([]);
+  const [removedBuiltInIds, setRemovedBuiltInIds]     = useState<string[]>([]);
+  const [showHiddenBuiltIns, setShowHiddenBuiltIns]   = useState(false);
+  const [pendingRemove, setPendingRemove]             = useState<ModelOption | null>(null);
+  const [usageOpen, setUsageOpen]                     = useState(false);
+  const retriedOnceRef = useRef(false);
+  const fillAllToastIdRef = useRef<string | null>(null);
+
+  // Hydrate user-added + removed-built-in ids on mount
+  useEffect(() => {
+    setUserAddedIds(getAddedIds());
+    setRemovedBuiltInIds(getRemovedBuiltInIds());
+  }, []);
+
+  // Adapter: turn a catalogue entry into the ModelOption shape the picker
+  // expects. Used to merge user-added catalogue entries into the effective
+  // model list rendered in the home dashboard cards + sidebar dropdown.
+  const catalogueToModelOption = useCallback((id: string): ModelOption | null => {
+    const entry = AI_CATALOGUE.find((e) => e.id === id);
+    if (!entry) return null;
+    return {
+      value: entry.id as ImageModel,           // string id; not in the typed ImageModel union
+      label: entry.label,
+      badge: entry.badge,
+      provider: entry.provider,
+      providerKey: (entry.providerKey === "anthropic" || entry.providerKey === "google" || entry.providerKey === "deepseek" || entry.providerKey === "mistral" || entry.providerKey === "midjourney" || entry.providerKey === "adobe" || entry.providerKey === "luma" || entry.providerKey === "pika" || entry.providerKey === "stability")
+        ? "openai"                              // unknown providerKey → coerce to "openai" so existing UI rendering paths don't break (status reads use it for display only; preview entries don't actually generate)
+        : (entry.providerKey ?? "openai") as ProviderKey,
+      billingUrl: entry.billingUrl,
+      note: entry.description,
+      tier: entry.pricing.toLowerCase().includes("free") ? "free-tier" : "paid",
+      pricing: entry.pricing,
+      kind: entry.role === "animation" ? "animation" : "image",
+    };
+  }, []);
+
+  // Raw merged list (built-ins minus hidden + user-added) — no health sorting yet.
+  // This feeds the health hook; sorting happens in effectiveModelOptions below.
+  const rawModelOptions = useMemo<ModelOption[]>(() => {
+    const removed   = new Set(removedBuiltInIds);
+    const builtInsVisible = MODEL_OPTIONS.filter((m) => showHiddenBuiltIns || !removed.has(m.value));
+    const adds = userAddedIds
+      .map((id) => catalogueToModelOption(id))
+      .filter((m): m is ModelOption => m !== null);
+    const builtInValues = new Set(MODEL_OPTIONS.map((m) => m.value));
+    return [...builtInsVisible, ...adds.filter((m) => !builtInValues.has(m.value))];
+  }, [userAddedIds, removedBuiltInIds, showHiddenBuiltIns, catalogueToModelOption]);
+
+  // ── 30-second AI watchdog ──────────────────────────────────────────────────
+  // Polls /api/usage every 30s and computes per-model health, fires toasts on
+  // transitions to quota-out or stale so the user knows without watching logs.
+  const modelHealthInputs = useMemo(
+    () => rawModelOptions.map((m) => ({ value: m.value, providerKey: m.providerKey, kind: m.kind })),
+    [rawModelOptions]
+  );
+
+  const { modelHealthMap } = useModelHealth({
+    models: modelHealthInputs,
+    selectedImageModel: selectedModel,
+    selectedAnimationModel,
+    subscribedModels,
+    providerStatus,
+    catalogue: AI_CATALOGUE,
+    enabled: true,
+    onTransition: (modelId, _from, to) => {
+      const opt = rawModelOptions.find((m) => m.value === modelId);
+      if (to.status === "quota-out") {
+        toasts.push({
+          kind: "error",
+          key: `health:quota:${modelId}`,
+          title: `${opt?.label ?? modelId} — Quota out`,
+          body: to.reason,
+          action: opt?.billingUrl ? { label: "Top up ↗", href: opt.billingUrl } : undefined,
+        });
+      } else if (to.status === "stale") {
+        toasts.push({
+          kind: "info",
+          key: `health:stale:${modelId}`,
+          title: `${opt?.label ?? modelId} — Suggested for removal`,
+          body: to.reason,
+        });
+      }
+    },
+  });
+
+  // Sorted effective model list — healthy models appear first (lower priority value).
+  const effectiveModelOptions = useMemo<ModelOption[]>(
+    () => [...rawModelOptions].sort((a, b) => (modelHealthMap[a.value]?.priority ?? 50) - (modelHealthMap[b.value]?.priority ?? 50)),
+    [rawModelOptions, modelHealthMap]
+  );
+
+  // Helper: is a given model.value a user-added catalogue entry (×-removable)?
+  const isUserAddedModel = useCallback((value: ImageModel) => userAddedIds.includes(value as string), [userAddedIds]);
+
+  // Helper: is this model currently hidden (built-in marked removed)?
+  const isHiddenBuiltIn   = useCallback((value: ImageModel) => removedBuiltInIds.includes(value as string), [removedBuiltInIds]);
+
+  // Open the confirm modal for ANY model (built-in or user-added).
+  const handleRequestRemoveModel = useCallback((m: ModelOption) => {
+    setPendingRemove(m);
+  }, []);
+
+  // Confirm modal callback: actually perform removal.
+  const handleConfirmRemove = useCallback(async (m: ModelOption, alsoRemoveKey: boolean) => {
+    const isBuiltIn = MODEL_OPTIONS.some((b) => b.value === m.value);
+    if (isBuiltIn) {
+      setRemovedBuiltInIds(markBuiltInRemoved(m.value as string));
+    } else {
+      setUserAddedIds(removeUserModel(m.value as string));
+    }
+    if (alsoRemoveKey && m.providerKey !== "free") {
+      try {
+        await fetch(`/api/api-keys/${m.providerKey}`, { method: "DELETE" });
+      } catch (err) {
+        console.warn("[remove-model] DELETE api-keys failed:", err);
+      }
+      // Refresh provider status (resolved at call time, not hook creation,
+      // to avoid the TDZ — refreshProviderStatus is declared further below).
+      // We dispatch to a ref so we don't have to list it in deps.
+      refreshStatusRef.current?.();
+    }
+    toasts.push({
+      kind: "info",
+      key: `removed:${m.value}`,
+      title: isBuiltIn ? `${m.label} hidden` : `${m.label} removed`,
+      body: isBuiltIn
+        ? `Toggle "Show hidden" to bring it back.${alsoRemoveKey ? " API key also cleared." : ""}`
+        : `Search to re-add anytime.${alsoRemoveKey ? " API key also cleared." : ""}`,
+    });
+    setPendingRemove(null);
+  }, [toasts]);
+
+  // Un-hide a built-in that was previously marked removed (used by Show-hidden toggle).
+  const handleUnhideBuiltIn = useCallback((value: ImageModel) => {
+    setRemovedBuiltInIds(unmarkBuiltInRemoved(value as string));
+  }, []);
+
+  // Kind-aware model setter: picks the right slot (image vs animation) by
+  // looking at the model's `kind` in MODEL_OPTIONS. Existing call sites that
+  // invoke `setSelectedModel(value)` continue to work — they just route to
+  // the correct slot now. Persists both selections to localStorage.
+  const setSelectedModel = useCallback((value: ImageModel) => {
+    const opt = MODEL_OPTIONS.find((m) => m.value === value);
+    if (!opt) return;
+    if (opt.kind === "animation") {
+      setSelectedAnimationModelRaw(value);
+      try { localStorage.setItem("slotforge.selectedAnimationModel", value); } catch {}
+    } else {
+      setSelectedModelRaw(value);
+      try { localStorage.setItem("slotforge.selectedImageModel", value); } catch {}
+    }
+  }, []);
+
+  // Hydrate persisted selections on mount
+  useEffect(() => {
+    try {
+      const im = localStorage.getItem("slotforge.selectedImageModel") as ImageModel | null;
+      const am = localStorage.getItem("slotforge.selectedAnimationModel") as ImageModel | null;
+      const pm = localStorage.getItem("slotforge.selectedPromptModel");
+      if (im && MODEL_OPTIONS.some((m) => m.value === im && m.kind !== "animation")) {
+        setSelectedModelRaw(im);
+      }
+      if (am && MODEL_OPTIONS.some((m) => m.value === am && m.kind === "animation")) {
+        setSelectedAnimationModelRaw(am);
+      }
+      if (pm) setSelectedPromptModelRaw(pm);
+    } catch { /* ignore */ }
+  }, []);
+
+  // Setter for the prompt model — wraps localStorage persist + toast
+  const setSelectedPromptModel = useCallback((apiModel: string) => {
+    setSelectedPromptModelRaw(apiModel);
+    try { localStorage.setItem("slotforge.selectedPromptModel", apiModel); } catch {}
+  }, []);
 
   // AbortController for the in-flight SSE generation request
   const abortRef = useRef<AbortController | null>(null);
 
+  // Stable id used for the auto-save record during streaming. Set in
+  // handleSubmit when generation starts; reused for every incremental save
+  // so we always overwrite the same project entry instead of creating Ns.
+  const inFlightProjectIdRef = useRef<string | null>(null);
+
+  // Forward-ref to refreshProviderStatus so callbacks defined earlier in
+  // the component body can call it without triggering a TDZ.
+  const refreshStatusRef = useRef<() => void>(() => {});
+
   // Computed: true while the SSE stream is open or per-asset regenerations are running
   const isGenerating = step === "loading" || (step === "results" && regeneratingIds.size > 0);
 
-  // Load projects from localStorage on mount
+  // Load projects from IndexedDB (async) on mount
   useEffect(() => {
-    setSavedProjects(loadProjects());
+    let cancelled = false;
+    void loadProjects().then((projects) => {
+      if (!cancelled) setSavedProjects(projects);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   // Fetch provider activation status once per session
@@ -154,6 +410,7 @@ export default function ProjectPage() {
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (data?.providers) setProviderStatus(data.providers as ProviderStatus);
+        if (data?.roles)     setRoleHealth(data.roles as RoleHealthMap);
         // Bump the tick counter on every successful poll so the status dots
         // re-mount and run the sync-blink animation, giving the user a live
         // visual cue that the system is checking for subscription / key updates.
@@ -163,6 +420,7 @@ export default function ProjectPage() {
   }, []);
 
   useEffect(() => {
+    refreshStatusRef.current = refreshProviderStatus;
     refreshProviderStatus();
   }, [refreshProviderStatus]);
 
@@ -228,7 +486,21 @@ export default function ProjectPage() {
 
   const markQuotaExhausted = useCallback((p: ProviderKey, exhausted: boolean) => {
     setQuotaState((prev) => ({ ...prev, [p]: exhausted }));
-  }, []);
+    // Map provider → billing URL → topup-style sticky toast so the user sees
+    // exactly which API failed and where to recharge.
+    if (exhausted) {
+      const provider = MODEL_OPTIONS.find((m) => m.providerKey === p);
+      const role     = p === "openai" ? "Prompt assistant + image generation" : p === "runway" ? "Animation generation" : "Image generation";
+      toasts.apiAlert({
+        role,
+        provider: provider?.provider ?? p,
+        reason: "Quota exhausted — top up to continue.",
+        billingUrl: provider?.billingUrl,
+      });
+    } else {
+      toasts.clearByKey(`alert:${p}`);
+    }
+  }, [toasts]);
 
   // Hydrate subscribedModels from localStorage on mount
   useEffect(() => {
@@ -293,13 +565,29 @@ export default function ProjectPage() {
   // cancelled checkout would silently lie about the user's state.
   const initiateSubscribe = useCallback((m: ImageModel) => {
     const opt = MODEL_OPTIONS.find((x) => x.value === m);
-    if (opt) window.open(opt.billingUrl, "_blank", "noopener,noreferrer");
-    // If they're already subscribed, treat the click as "Manage subscription"
-    // — open billing tab but skip the confirm modal.
+    if (!opt) return;
+    const dest = BILLING_DESTINATIONS[opt.providerKey];
+    // Transparent disclosure BEFORE opening — toast shows the verified URL +
+    // a one-line description so the user doesn't get blindsided by an
+    // unexpected page (the dev.runwayml.com vs app.runwayml.com problem).
+    toasts.push({
+      kind: "info",
+      key: `sub-preview:${opt.providerKey}`,
+      title: `Opening ${opt.provider} billing…`,
+      body: `${dest?.description ?? `Destination: ${opt.billingUrl}`} (verified ${dest?.verifiedAt ?? "n/a"})`,
+      action: { label: "Open in new tab", href: opt.billingUrl },
+    });
+    // Pop a small payment window (popup-style) instead of a full new-tab —
+    // gives users the focused "pay then come back" flow they asked for.
+    // Most browsers allow popups when triggered by a click handler like this.
+    const popup = window.open(opt.billingUrl, `subscribe-${opt.providerKey}`, "noopener,noreferrer,width=1100,height=820,menubar=no,toolbar=no,location=yes,status=no");
+    // Some browsers block popups even on click — fall back to plain new tab.
+    if (!popup) window.open(opt.billingUrl, "_blank", "noopener,noreferrer");
+
     if (subscribedModels.has(m)) return;
     setPendingSubConfirm(m);
     setModelOpen(false);
-  }, [subscribedModels]);
+  }, [subscribedModels, toasts]);
 
   // Sync browser tab title
   useEffect(() => {
@@ -323,11 +611,12 @@ export default function ProjectPage() {
       assets,
       form: submittedForm,
     };
-    const updated = saveProject(project);
-    setSavedProjects(updated);
-    setIsSaved(true);
-    setPendingAutoSave(false);
-    setTimeout(() => setIsSaved(false), 3000);
+    void saveProject(project).then((updated) => {
+      setSavedProjects(updated);
+      setIsSaved(true);
+      setPendingAutoSave(false);
+      setTimeout(() => setIsSaved(false), 3000);
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [regeneratingIds.size, pendingAutoSave, step]);
 
@@ -337,10 +626,26 @@ export default function ProjectPage() {
   // Handlers
   // ---------------------------------------------------------------------------
 
-  const handleSubmit = useCallback(async (form: ProjectForm) => {
+  const handleSubmit = useCallback(async (form: ProjectForm, failoverModel?: string) => {
     // Cancel any previous in-flight generation
     abortRef.current?.abort();
     abortRef.current = new AbortController();
+
+    // failoverModel is set by the auto-failover path so the retry uses the
+    // new model immediately without waiting for the next render cycle.
+    const activeModel = failoverModel ?? selectedModel;
+    const imageOpt  = MODEL_OPTIONS.find((m) => m.value === activeModel);
+    const animOpt   = MODEL_OPTIONS.find((m) => m.value === selectedAnimationModel);
+    toasts.push({
+      kind: "info",
+      key: "generating-active",
+      title: "Generating your slot assets…",
+      body: [
+        imageOpt  ? `Graphics: ${imageOpt.label} (${imageOpt.provider})`      : null,
+        animOpt   ? `Animation: ${animOpt.label} (${animOpt.provider})`        : null,
+      ].filter(Boolean).join("  ·  "),
+      sticky: true,
+    });
 
     setStep("loading");
     setError(null);
@@ -349,11 +654,15 @@ export default function ProjectPage() {
     setIsSaved(false);
     setPendingAutoSave(false);
 
+    // Mint a stable id NOW so every incremental auto-save during streaming
+    // overwrites the same record instead of creating duplicates.
+    inFlightProjectIdRef.current = nanoid();
+
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, imageModel: selectedModel, slotType }),
+        body: JSON.stringify({ ...form, imageModel: activeModel, slotType, promptModel: selectedPromptModel }),
         signal: abortRef.current.signal,
       });
 
@@ -367,6 +676,10 @@ export default function ProjectPage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      // Capture styleDNA from the init event so we can include it in every
+      // incremental auto-save during streaming.
+      let streamStyleDNA: StyleDNA | null = null;
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -379,14 +692,31 @@ export default function ProjectPage() {
           const payload = JSON.parse(part.slice(6));
 
           if (payload.type === "init") {
+            streamStyleDNA = payload.styleDNA;
             setResult({ styleDNA: payload.styleDNA, assets: payload.assets });
             setAssets(payload.assets);
             setRegenIds(new Set<string>(payload.assets.map((a: Asset) => a.id)));
             setStep("results");
           } else if (payload.type === "asset") {
-            setAssets((prev) =>
-              prev.map((a) => (a.id === payload.asset.id ? payload.asset : a))
-            );
+            setAssets((prev) => {
+              const updated = prev.map((a) => (a.id === payload.asset.id ? payload.asset : a));
+              // Auto-save: overwrite the in-flight project record on every
+              // asset arrival so partial generations survive a tab close.
+              const pid = inFlightProjectIdRef.current;
+              if (pid && streamStyleDNA) {
+                const project: SavedProject = {
+                  id: pid,
+                  gameName: form.gameName,
+                  savedAt: new Date().toISOString(),
+                  imageModel: selectedModel,
+                  styleDNA: streamStyleDNA,
+                  assets: updated,
+                  form,
+                };
+                void saveProject(project).then(setSavedProjects);
+              }
+              return updated;
+            });
             setRegenIds((prev) => {
               const next = new Set(prev);
               next.delete(payload.asset.id);
@@ -398,12 +728,40 @@ export default function ProjectPage() {
         }
       }
       setRegenIds(new Set());
+      retriedOnceRef.current = false; // reset on success
+      toasts.clearByKey("generating-active");
     } catch (err) {
+      toasts.clearByKey("generating-active");
       if (err instanceof Error && err.name === "AbortError") return; // clean unmount/reload
+
+      const msg = err instanceof Error ? err.message : "";
+      const isQuota = msg.includes("quota") || msg.includes("429") || msg.includes("rate");
+
+      // Auto-failover: on quota/rate error, retry once with the next-best healthy model.
+      if (isQuota && !retriedOnceRef.current) {
+        const nextModel = effectiveModelOptions.find(
+          (m) => m.kind === "image" && m.value !== selectedModel && (modelHealthMap[m.value]?.status === "healthy" || m.providerKey === "free")
+        );
+        if (nextModel) {
+          retriedOnceRef.current = true;
+          const fromLabel = MODEL_OPTIONS.find((m) => m.value === selectedModel)?.label ?? selectedModel;
+          toasts.push({
+            kind: "info",
+            key: "auto-failover",
+            title: `${fromLabel} hit quota — retrying with ${nextModel.label}`,
+            body: "Auto-failover: switching to next available model. One moment.",
+          });
+          setSelectedModelRaw(nextModel.value);
+          void handleSubmit(form, nextModel.value);
+          return;
+        }
+      }
+      retriedOnceRef.current = false;
       setError(err instanceof Error ? err.message : "Unknown error");
       setStep("form");
     }
-  }, [selectedModel, slotType]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedModel, slotType, effectiveModelOptions, modelHealthMap]);
 
   const handleToggleSelect = useCallback((id: string) => {
     setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, selected: !a.selected } : a)));
@@ -509,15 +867,26 @@ export default function ProjectPage() {
       assets,
       form: submittedForm,
     };
-    const updated = saveProject(project);
-    setSavedProjects(updated);
-    setIsSaved(true);
-    setTimeout(() => setIsSaved(false), 3000);
+    void saveProject(project).then((updated) => {
+      setSavedProjects(updated);
+      setIsSaved(true);
+      setTimeout(() => setIsSaved(false), 3000);
+    });
   }, [result, submittedForm, gameName, selectedModel, assets, isGenerating]);
 
   const handleRestoreProject = useCallback((project: SavedProject) => {
-    setResult({ styleDNA: project.styleDNA, assets: project.assets });
-    setAssets(project.assets);
+    // For any asset whose imageUrl is missing or empty, fall back to the
+    // server-cache URL — the <img> tag will fetch the bytes from disk via
+    // /api/assets/<projectId>/<assetId>. If neither is present (legacy
+    // pre-IndexedDB project), the asset stays empty and the regenerate
+    // banner offers re-generation as a last resort.
+    const restored = project.assets.map((a) =>
+      a.imageUrl
+        ? a
+        : { ...a, imageUrl: assetCacheUrl(project.id, a.id) }
+    );
+    setResult({ styleDNA: project.styleDNA, assets: restored });
+    setAssets(restored);
     setGameName(project.gameName);
     setSubmittedForm(project.form);
     setSelectedModel(project.imageModel);
@@ -529,8 +898,7 @@ export default function ProjectPage() {
   }, []);
 
   const handleDeleteProject = useCallback((id: string) => {
-    const updated = deleteProject(id);
-    setSavedProjects(updated);
+    void deleteProject(id).then(setSavedProjects);
   }, []);
 
   const handleReset = useCallback(() => {
@@ -568,6 +936,8 @@ export default function ProjectPage() {
         step={step}
         gameName={gameName}
         selectedModel={selectedModel}
+        selectedAnimationModel={selectedAnimationModel}
+        roleHealth={roleHealth}
         modelOpen={modelOpen}
         savedProjects={savedProjects}
         hasResults={result !== null}
@@ -593,6 +963,14 @@ export default function ProjectPage() {
         apiKeysOpen={apiKeysOpen}
         onOpenApiKeys={() => setApiKeysOpen(true)}
         syncTick={syncTick}
+        onSwapRole={setSwapRole}
+        userAddedIds={userAddedIds}
+        onPickFromSearch={setPickedCatalogueEntry}
+        effectiveModelOptions={effectiveModelOptions}
+        isUserAdded={isUserAddedModel}
+        onRequestRemoveModel={handleRequestRemoveModel}
+        modelHealthMap={modelHealthMap}
+        onOpenUsage={() => setUsageOpen(true)}
       />
 
       {/* Did-you-actually-subscribe confirmation modal — opens after the user
@@ -641,6 +1019,69 @@ export default function ProjectPage() {
         onClose={() => setApiKeysOpen(false)}
         onChanged={refreshProviderStatus}
       />
+
+      {/* AI Usage Monitor panel — admin only */}
+      <UsagePanel open={usageOpen} onClose={() => setUsageOpen(false)} />
+
+      {/* Remove-model confirm modal — fired from any × button (built-in or user-added). */}
+      {pendingRemove && (
+        <RemoveModelConfirmModal
+          modelLabel={pendingRemove.label}
+          providerKey={pendingRemove.providerKey}
+          providerLabel={pendingRemove.provider}
+          isBuiltIn={MODEL_OPTIONS.some((b) => b.value === pendingRemove.value)}
+          affectedSiblings={effectiveModelOptions
+            .filter((x) => x.providerKey === pendingRemove.providerKey && x.value !== pendingRemove.value)
+            .map((x) => x.label)}
+          canCleanupKey={pendingRemove.providerKey !== "free"}
+          onClose={() => setPendingRemove(null)}
+          onConfirm={(alsoKey) => handleConfirmRemove(pendingRemove, alsoKey)}
+        />
+      )}
+
+      {/* Catalogue compatibility modal — opens when the user picks a model
+          from the search dropdown. Shows yes/no/why + add-to-platform CTA. */}
+      {pickedCatalogueEntry && (
+        <ModelCompatibilityModal
+          entry={pickedCatalogueEntry}
+          onClose={() => setPickedCatalogueEntry(null)}
+          onConfirmAdd={(entry) => {
+            const next = addUserModel(entry.id);
+            setUserAddedIds(next);
+            toasts.push({
+              kind: "success",
+              title: `${entry.label} added`,
+              body: `${entry.provider} · ${entry.role} role. Open the API Keys panel to paste your token, then it'll go live.`,
+              action: { label: "Open API Keys", onClick: () => setApiKeysOpen(true) },
+            });
+          }}
+        />
+      )}
+
+      {/* Role-swap modal — opens when the user clicks an AI Roles row */}
+      {swapRole && (
+        <RoleSelectorModal
+          role={swapRole}
+          activeApiModel={
+            swapRole === "prompt"    ? selectedPromptModel
+          : swapRole === "image"     ? selectedModel
+          :                            selectedAnimationModel
+          }
+          onClose={() => setSwapRole(null)}
+          onPick={(opt) => {
+            if (swapRole === "prompt") {
+              setSelectedPromptModel(opt.apiModel);
+              toasts.poweredBy("Prompt assistant", opt.label, opt.providerLabel);
+            } else if (swapRole === "image") {
+              setSelectedModel(opt.apiModel as ImageModel);
+              toasts.poweredBy("Image generation", opt.label, opt.providerLabel);
+            } else {
+              setSelectedModel(opt.apiModel as ImageModel);
+              toasts.poweredBy("Animation generation", opt.label, opt.providerLabel);
+            }
+          }}
+        />
+      )}
 
       {/* Main content */}
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -692,6 +1133,15 @@ export default function ProjectPage() {
               onSubscribeModel={initiateSubscribe}
               onUnsubscribeModel={unmarkSubscribed}
               syncTick={syncTick}
+              userAddedIds={userAddedIds}
+              onPickFromSearch={setPickedCatalogueEntry}
+              effectiveModelOptions={effectiveModelOptions}
+              isUserAdded={isUserAddedModel}
+              onRequestRemoveModel={handleRequestRemoveModel}
+              showHiddenBuiltIns={showHiddenBuiltIns}
+              onToggleShowHidden={() => setShowHiddenBuiltIns((v) => !v)}
+              hasHidden={removedBuiltInIds.length > 0}
+              modelHealthMap={modelHealthMap}
             />
           )}
 
@@ -715,11 +1165,43 @@ export default function ProjectPage() {
                   </div>
                 )}
               </div>
+
+              {/* Pro Tip moved to TOP of the form (was previously at bottom of HomeView) */}
+              <div className="mb-6 rounded-2xl bg-indigo-900/15 border border-indigo-500/25 p-5 flex items-start gap-4">
+                <div className="w-11 h-11 rounded-xl bg-indigo-600/25 border border-indigo-500/30 flex items-center justify-center text-2xl flex-shrink-0">💡</div>
+                <div>
+                  <p className="text-sm font-bold text-white mb-1">Pro Tip — Use AI Assist</p>
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Only Game Title and Theme are required. Click{" "}
+                    <span className="text-indigo-300 font-semibold">✦ Fill All</span>{" "}
+                    once you&apos;ve filled them and AI will complete every other field.
+                  </p>
+                </div>
+              </div>
+
               <ProjectFormComponent
                 onSubmit={handleSubmit}
                 isLoading={false}
                 slotType={slotType}
                 onQuotaExhausted={() => markQuotaExhausted("openai", true)}
+                onPoweredBy={toasts.poweredBy}
+                onFillAllStart={() => {
+                  const id = toasts.push({
+                    kind: "info",
+                    key: "fill-all-active",
+                    title: "AI filling all fields…",
+                    body: "Prompt assistant: GPT-4o-mini · OpenAI. Generating suggestions for every empty field.",
+                    sticky: true,
+                  });
+                  fillAllToastIdRef.current = id;
+                }}
+                onFillAllEnd={() => {
+                  if (fillAllToastIdRef.current) {
+                    toasts.dismiss(fillAllToastIdRef.current);
+                    fillAllToastIdRef.current = null;
+                  }
+                }}
+                promptModel={selectedPromptModel}
               />
             </div>
           )}
@@ -732,6 +1214,24 @@ export default function ProjectPage() {
 
           {step === "results" && result && (
             <div className="px-10 py-10 max-w-6xl mx-auto w-full animate-fade-in">
+              {assets.length > 0 && assets.every((a) => !a.imageUrl) && submittedForm && (
+                <div className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-semibold text-amber-200">
+                      Images couldn&apos;t be restored from history
+                    </p>
+                    <p className="text-xs text-amber-100/80 mt-1 leading-relaxed">
+                      This project was saved when storage was on localStorage and the images exceeded the 5MB browser quota — only the form metadata survived. Storage has now been upgraded to IndexedDB so this won&apos;t happen again. Click below to re-generate the images from the saved brief.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleSubmit(submittedForm)}
+                    className="flex-shrink-0 h-10 px-4 rounded-xl text-sm font-medium text-white bg-gradient-to-r from-amber-500 to-amber-600 hover:opacity-95 active:scale-[0.99] transition"
+                  >
+                    Regenerate
+                  </button>
+                </div>
+              )}
               <ResultsView
                 result={result}
                 assets={assets}
@@ -767,6 +1267,8 @@ interface SidebarProps {
   step: Step;
   gameName: string;
   selectedModel: ImageModel;
+  selectedAnimationModel: ImageModel;
+  roleHealth: RoleHealthMap | null;
   modelOpen: boolean;
   savedProjects: SavedProject[];
   hasResults: boolean;
@@ -792,19 +1294,24 @@ interface SidebarProps {
   apiKeysOpen: boolean;
   onOpenApiKeys: () => void;
   syncTick: number;
+  onSwapRole: (role: AIRole) => void;
+  userAddedIds: string[];
+  onPickFromSearch: (entry: CatalogueEntry) => void;
+  effectiveModelOptions: ModelOption[];
+  isUserAdded: (m: ImageModel) => boolean;
+  onRequestRemoveModel: (m: ModelOption) => void;
+  modelHealthMap: Record<string, ModelHealth>;
+  onOpenUsage: () => void;
 }
 
 function Sidebar({
-  step, gameName, selectedModel, modelOpen, savedProjects, hasResults, isGenerating, providerStatus, quotaState, subscribedModels, slotType, onSelectSlotType, theme, onSelectTheme,
+  step, gameName, selectedModel, selectedAnimationModel, roleHealth, modelOpen, savedProjects, hasResults, isGenerating, providerStatus, quotaState, subscribedModels, slotType, onSelectSlotType, theme, onSelectTheme,
   onNewProject, onGoHome, onSlotPreview, onGoResults, onPickModel, onSubscribeModel, onUnsubscribeModel, onModelOpen,
   onRestoreProject, onDeleteProject,
-  currentRole, apiKeysOpen, onOpenApiKeys, syncTick,
+  currentRole, apiKeysOpen, onOpenApiKeys, syncTick, onSwapRole, userAddedIds, onPickFromSearch, effectiveModelOptions, isUserAdded, onRequestRemoveModel, modelHealthMap: _modelHealthMap, onOpenUsage,
 }: SidebarProps) {
-  const activeModel = MODEL_OPTIONS.find((m) => m.value === selectedModel)!;
-  const activeStatusEnum = modelStatusOf(activeModel, providerStatus, quotaState);
-  const activeIsExhausted = activeStatusEnum === "quota_exhausted";
-  const activeIsConfigured = activeStatusEnum === "active";
-  const activeIsSubscribed = subscribedModels.has(selectedModel);
+  const activeImageModel     = MODEL_OPTIONS.find((m) => m.value === selectedModel)!;
+  const activeAnimationModel = MODEL_OPTIONS.find((m) => m.value === selectedAnimationModel)!;
 
   // Bulletproof click-outside: capture mousedown anywhere on the page; if the
   // click target is NOT inside the wrapper (which holds both trigger + panel),
@@ -962,7 +1469,7 @@ function Sidebar({
         )}
 
         <SidebarDivider label="Advanced" />
-        <div className="px-2.5 pb-4 flex flex-col gap-1">
+        <div className="px-2.5 pb-2 flex flex-col gap-1">
           <NavItem
             icon="⚙" label="Preferences" active={false}
             onClick={() => {}} comingSoon
@@ -975,180 +1482,152 @@ function Sidebar({
               tip="Manage OpenAI / Replicate / Runway / Imagine Art keys at runtime. Encrypted on the server; admin-only."
             />
           )}
-        </div>
-      </div>
-
-      {/* Theme picker pinned at bottom (above slot type) */}
-      <div className="flex-shrink-0 px-4 pt-4 pb-3 border-t border-white/[0.07]">
-        <p className="text-[11px] text-zinc-500 uppercase tracking-[0.18em] mb-2.5 px-1 flex items-center gap-2">
-          <span className="text-sm">🎨</span> Theme
-        </p>
-        <div className="flex items-center justify-between gap-1.5">
-          {THEMES.map((t) => {
-            const isActive = t.value === theme;
-            return (
-              <button
-                key={t.value}
-                type="button"
-                onClick={() => onSelectTheme(t.value)}
-                title={`${t.label} — ${t.tagline}`}
-                aria-label={`Switch to ${t.label} theme`}
-                className={`group relative w-9 h-9 rounded-full bg-gradient-to-br ${t.swatchFrom} ${t.swatchTo} transition-all hover:scale-110 ${
-                  isActive
-                    ? "ring-2 ring-white ring-offset-2 ring-offset-[var(--bg-sidebar)] shadow-lg"
-                    : "ring-1 ring-white/15 hover:ring-white/40"
-                }`}
-              >
-                {isActive && (
-                  <span className="absolute inset-0 flex items-center justify-center text-white">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="20 6 9 17 4 12"/>
-                    </svg>
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-        <p className="text-[10px] text-zinc-600 mt-2 px-1 truncate" title={THEMES.find((t) => t.value === theme)?.tagline}>
-          {THEMES.find((t) => t.value === theme)?.label}
-        </p>
-      </div>
-
-      {/* Slot type picker pinned at bottom (above model selector) */}
-      <div className="flex-shrink-0 px-4 pt-4 pb-3 border-t border-white/[0.07]">
-        <p className="text-[11px] text-zinc-500 uppercase tracking-[0.18em] mb-2.5 px-1 flex items-center gap-2">
-          <span className="text-sm">🎰</span> Slot Type
-        </p>
-        <div className="grid grid-cols-2 gap-2">
-          {SLOT_TYPES.map((t) => {
-            const isActive = t.value === slotType;
-            return (
-              <button
-                key={t.value}
-                type="button"
-                onClick={() => onSelectSlotType(t.value)}
-                title={t.tagline}
-                className={`flex flex-col items-center justify-center gap-0.5 rounded-lg px-2.5 py-2.5 text-xs font-bold transition-all ${
-                  isActive
-                    ? "bg-gradient-to-br from-indigo-600/40 to-purple-600/40 border border-indigo-400/50 text-white shadow-[inset_0_0_0_1px_rgba(99,102,241,0.25)]"
-                    : "bg-white/5 border border-white/10 text-zinc-400 hover:bg-white/10 hover:text-zinc-200"
-                }`}
-              >
-                <span className="text-xs tracking-wide">{t.short}</span>
-                {isActive && <span className="text-[9px] text-emerald-300 font-bold tracking-wider">ACTIVE ✓</span>}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Model selector pinned at bottom */}
-      <div className="flex-shrink-0 p-4 border-t border-white/[0.07]">
-        <p className="text-[11px] text-zinc-500 uppercase tracking-[0.18em] mb-2.5 px-1">Image Model</p>
-        <div ref={modelWrapperRef} className="relative">
-          <button
-            type="button"
-            onClick={() => onModelOpen(!modelOpen)}
-            className={`w-full flex items-center gap-2.5 rounded-xl px-3.5 py-3 text-sm font-medium transition-all ${
-              activeIsExhausted
-                ? "bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-100 shadow-[0_0_0_1px_rgba(244,63,94,0.25)]"
-                : activeIsSubscribed
-                ? "bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-400/40 text-cyan-100 shadow-[0_0_0_1px_rgba(34,211,238,0.3),0_0_18px_-6px_rgba(34,211,238,0.5)]"
-                : "bg-indigo-600/15 hover:bg-indigo-600/25 border border-indigo-500/30 text-zinc-300 shadow-[0_0_0_1px_rgba(99,102,241,0.15)]"
-            }`}
-            title={
-              activeIsExhausted ? `${activeModel.label} — Quota exhausted, top up to continue`
-              : activeIsSubscribed ? `${activeModel.label} — Subscribed`
-              : activeIsConfigured ? `${activeModel.label} — Active`
-              : `${activeModel.label} — needs API key`
-            }
-          >
-            <span
-              key={syncTick}
-              style={{ animation: "var(--animate-sync-blink)" }}
-              className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
-                activeIsExhausted ? "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)] animate-pulse"
-                : activeIsSubscribed ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.7)]"
-                : activeIsConfigured ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.7)]"
-                : "bg-amber-400"
-              }`}
+          {(currentRole === "ADMIN" || currentRole === "SUPER_ADMIN") && (
+            <NavItem
+              icon="📊" label="AI Usage Monitor" active={false}
+              onClick={onOpenUsage}
+              tip="Per-provider call outcome stats — success/failure counts, last event timestamps, traffic-light health. Admin only."
             />
-            <span className="flex-1 text-left truncate">
-              {activeModel.label}
-              {activeIsExhausted && <span className="ml-1.5 text-[10px] font-bold tracking-wider">· QUOTA OUT</span>}
-              {activeIsSubscribed && !activeIsExhausted && <span className="ml-1.5 text-[10px] font-bold tracking-wider text-cyan-300">· SUBSCRIBED</span>}
-            </span>
-            <ChevronIcon open={modelOpen} />
-          </button>
-
-          {modelOpen && (
-            <div className="absolute bottom-full left-0 right-0 mb-2 rounded-2xl bg-[var(--bg-elevated)] border border-white/15 shadow-2xl overflow-hidden z-50 max-h-[70vh] overflow-y-auto">
-              <div className="px-3 py-2 border-b border-white/10 sticky top-0 bg-[var(--bg-elevated)]">
-                <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">
-                  {MODEL_OPTIONS.length} AI Models — requires API key
-                </p>
-              </div>
-              {MODEL_OPTIONS.map((m) => {
-                const isActive = m.value === selectedModel;
-                const status = modelStatusOf(m, providerStatus, quotaState);
-                const exhausted = status === "quota_exhausted";
-                const subscribed = subscribedModels.has(m.value);
-                return (
-                  <div
-                    key={m.value}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => onPickModel(m.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPickModel(m.value); } }}
-                    className={`w-full flex items-start justify-between px-3 py-2.5 text-left transition-all hover:bg-white/5 gap-2 border-l-2 cursor-pointer ${
-                      exhausted
-                        ? "bg-rose-900/15 border-l-rose-400 shadow-[inset_0_0_0_1px_rgba(244,63,94,0.18)]"
-                        : subscribed
-                        ? "bg-cyan-900/15 border-l-cyan-400 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.18)]"
-                        : isActive
-                        ? "bg-indigo-600/15 border-l-indigo-400 shadow-[inset_0_0_0_1px_rgba(99,102,241,0.15)]"
-                        : "border-l-transparent"
-                    }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className={`text-xs font-medium ${exhausted ? "text-rose-200" : subscribed ? "text-cyan-100" : isActive ? "text-white" : "text-zinc-300"}`}>{m.label}</span>
-                        {m.badge && (
-                          <span className="text-[9px] rounded-full bg-indigo-600/20 border border-indigo-500/20 px-1.5 py-0.5 text-indigo-400 flex-shrink-0">
-                            {m.badge}
-                          </span>
-                        )}
-                        <PriceBadge tier={m.tier} />
-                        <ActivationBadge status={status} />
-                        <SubscribedBadge show={subscribed} onUnsubscribe={() => onUnsubscribeModel(m.value)} />
-                      </div>
-                      <div className="text-[9px] text-zinc-600 mt-0.5">{m.provider} · <span className="text-emerald-400/80">{m.pricing}</span></div>
-                      {m.note && <div className="text-[9px] text-zinc-500 mt-0.5 leading-tight mb-1.5">{m.note}</div>}
-
-                      {/* Inline Subscribe button */}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onSubscribeModel(m.value);
-                        }}
-                        className="mt-1 inline-flex items-center gap-1 rounded-lg bg-[image:linear-gradient(to_right,var(--accent-from),var(--accent-to))] hover:opacity-90 px-2.5 py-1 text-[10px] font-bold text-white shadow-md shadow-indigo-900/30 transition-all"
-                        title={`Open ${providerDisplayName(m.providerKey)} billing in new tab and select ${m.label}`}
-                      >
-                        {subscribeLabel(m.providerKey)} ↗
-                      </button>
-                    </div>
-                    {isActive && (
-                      <span className="flex items-center justify-center w-4 h-4 rounded-full bg-indigo-500 flex-shrink-0 mt-0.5">
-                        <CheckSmIcon />
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
           )}
+        </div>
+
+        {/* ── Collapsible settings panels ───────────────────────────────────
+            Inside the scrollable region so they're always reachable regardless
+            of screen height. Sections fold by default; state persists in localStorage. */}
+        <div className="mt-2">
+          <CollapsibleSection id="ai-roles" title="AI Roles" icon="🧭" badgeCount={3}>
+            <div className="px-4 pt-1">
+              <RoleStatusStrip roles={roleHealth} syncTick={syncTick} onOpenApiKeys={onOpenApiKeys} onSwapRole={onSwapRole} />
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection id="active-models" title="Active AI Models" icon="🤖" badgeCount={2}>
+            <div className="px-4 pt-1 space-y-2">
+              <ModelSearch addedIds={userAddedIds} onPick={onPickFromSearch} />
+              <div ref={modelWrapperRef} className="relative space-y-2">
+                <ActiveModelChip
+                  role="image"
+                  roleLabel="Image"
+                  roleIcon="🖼️"
+                  model={activeImageModel}
+                  providerStatus={providerStatus}
+                  quotaState={quotaState}
+                  isSubscribed={subscribedModels.has(selectedModel)}
+                  onClick={() => onModelOpen(!modelOpen)}
+                  syncTick={syncTick}
+                />
+                <ActiveModelChip
+                  role="animation"
+                  roleLabel="Animation"
+                  roleIcon="🎬"
+                  model={activeAnimationModel}
+                  providerStatus={providerStatus}
+                  quotaState={quotaState}
+                  isSubscribed={subscribedModels.has(selectedAnimationModel)}
+                  onClick={() => onModelOpen(!modelOpen)}
+                  syncTick={syncTick}
+                />
+
+                {modelOpen && (
+                  <div className="absolute top-full left-0 right-0 mt-2 rounded-2xl bg-[var(--bg-elevated)] border border-white/15 shadow-2xl overflow-hidden z-50 max-h-[55vh] overflow-y-auto">
+                    <div className="px-3 py-2 border-b border-white/10 sticky top-0 bg-[var(--bg-elevated)] z-10">
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Pick a model — applies to its role</p>
+                      <p className="text-[10px] text-zinc-600 mt-0.5">Image picks update the image slot. Animation picks update the animation slot.</p>
+                    </div>
+                    <ModelGroup label="Image generation" icon="🖼️">
+                      {effectiveModelOptions.filter((m) => m.kind === "image").map((m) => (
+                        <ModelDropdownRow key={m.value} model={m} isActive={m.value === selectedModel} activeRoleLabel="Active for image" providerStatus={providerStatus} quotaState={quotaState} isSubscribed={subscribedModels.has(m.value)} onPick={onPickModel} onSubscribe={onSubscribeModel} onUnsubscribe={onUnsubscribeModel} removable={true} onRemove={() => onRequestRemoveModel(m)} />
+                      ))}
+                    </ModelGroup>
+                    <ModelGroup label="Animation generation" icon="🎬">
+                      {effectiveModelOptions.filter((m) => m.kind === "animation").map((m) => (
+                        <ModelDropdownRow key={m.value} model={m} isActive={m.value === selectedAnimationModel} activeRoleLabel="Active for animation" providerStatus={providerStatus} quotaState={quotaState} isSubscribed={subscribedModels.has(m.value)} onPick={onPickModel} onSubscribe={onSubscribeModel} onUnsubscribe={onUnsubscribeModel} removable={true} onRemove={() => onRequestRemoveModel(m)} />
+                      ))}
+                    </ModelGroup>
+                  </div>
+                )}
+              </div>
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection id="2d-assets" title="2D Assets" icon="📦" badgeCount={2}>
+            <div className="px-4 pt-1">
+              <div className="grid grid-cols-2 gap-2">
+                <a href="/build/utility-app" className="flex flex-col items-center justify-center gap-0.5 rounded-lg px-2.5 py-2.5 text-xs font-bold transition-all bg-white/5 border border-white/10 text-zinc-300 hover:bg-indigo-600/20 hover:border-indigo-500/40 hover:text-white" title="Build a utility app asset pack — guided 24-question wizard">
+                  <span className="text-base leading-none">🛠️</span>
+                  <span className="text-[11px] tracking-wide mt-0.5">Utility App</span>
+                </a>
+                <a href="/build/board-game" className="flex flex-col items-center justify-center gap-0.5 rounded-lg px-2.5 py-2.5 text-xs font-bold transition-all bg-white/5 border border-white/10 text-zinc-300 hover:bg-indigo-600/20 hover:border-indigo-500/40 hover:text-white" title="Build a board game asset pack — guided 25-question wizard">
+                  <span className="text-base leading-none">🎲</span>
+                  <span className="text-[11px] tracking-wide mt-0.5">Board Game</span>
+                </a>
+              </div>
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection id="slot-type" title="Slot Type" icon="🎰" badgeCount={SLOT_TYPES.length}>
+            <div className="px-4 pt-1">
+              <div className="grid grid-cols-2 gap-2">
+                {SLOT_TYPES.map((t) => {
+                  const isActive = t.value === slotType;
+                  return (
+                    <button
+                      key={t.value}
+                      type="button"
+                      onClick={() => onSelectSlotType(t.value)}
+                      title={t.tagline}
+                      className={`flex flex-col items-center justify-center gap-0.5 rounded-lg px-2.5 py-2.5 text-xs font-bold transition-all ${
+                        isActive
+                          ? "bg-gradient-to-br from-indigo-600/40 to-purple-600/40 border border-indigo-400/50 text-white shadow-[inset_0_0_0_1px_rgba(99,102,241,0.25)]"
+                          : "bg-white/5 border border-white/10 text-zinc-400 hover:bg-white/10 hover:text-zinc-200"
+                      }`}
+                    >
+                      <span className="text-xs tracking-wide">{t.short}</span>
+                      {isActive && <span className="text-[9px] text-emerald-300 font-bold tracking-wider">ACTIVE ✓</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection id="theme" title="Theme" icon="🎨" badgeCount={THEMES.length}>
+            <div className="px-4 pt-1">
+              <div className="flex items-center justify-between gap-1.5">
+                {THEMES.map((t) => {
+                  const isActive = t.value === theme;
+                  return (
+                    <button
+                      key={t.value}
+                      type="button"
+                      onClick={() => onSelectTheme(t.value)}
+                      title={`${t.label} — ${t.tagline}`}
+                      aria-label={`Switch to ${t.label} theme`}
+                      className={`group relative w-9 h-9 rounded-full bg-gradient-to-br ${t.swatchFrom} ${t.swatchTo} transition-all hover:scale-110 ${
+                        isActive
+                          ? "ring-2 ring-white ring-offset-2 ring-offset-[var(--bg-sidebar)] shadow-lg"
+                          : "ring-1 ring-white/15 hover:ring-white/40"
+                      }`}
+                    >
+                      {isActive && (
+                        <span className="absolute inset-0 flex items-center justify-center text-white">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12"/>
+                          </svg>
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-zinc-600 mt-2 px-1 truncate" title={THEMES.find((t) => t.value === theme)?.tagline}>
+                {THEMES.find((t) => t.value === theme)?.label}
+              </p>
+            </div>
+          </CollapsibleSection>
+
+          {/* Bottom breathing room */}
+          <div className="h-4" />
         </div>
       </div>
     </aside>
@@ -1158,6 +1637,146 @@ function Sidebar({
 // ---------------------------------------------------------------------------
 // Sidebar helpers
 // ---------------------------------------------------------------------------
+
+// One of the two compact "active" rows pinned in the sidebar (image + animation).
+function ActiveModelChip({
+  roleLabel, roleIcon, model, providerStatus, quotaState, isSubscribed, onClick, syncTick,
+}: {
+  role: "image" | "animation";
+  roleLabel: string;
+  roleIcon: string;
+  model: ModelOption;
+  providerStatus: ProviderStatus | null;
+  quotaState: QuotaState;
+  isSubscribed: boolean;
+  onClick: () => void;
+  syncTick: number;
+}) {
+  const status = modelStatusOf(model, providerStatus, quotaState);
+  const exhausted = status === "quota_exhausted";
+  const configured = status === "active";
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`Change ${roleLabel.toLowerCase()} model — currently ${model.label}`}
+      className={`w-full flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-medium transition-all border ${
+        exhausted     ? "bg-rose-600/15 border-rose-500/40 hover:bg-rose-600/25 text-rose-100"
+        : isSubscribed ? "bg-cyan-600/15 border-cyan-400/40 hover:bg-cyan-600/25 text-cyan-100"
+        : configured  ? "bg-indigo-600/12 border-indigo-500/25 hover:bg-indigo-600/20 text-zinc-200"
+                      : "bg-white/5 border-white/10 hover:bg-white/10 text-zinc-300"
+      }`}
+    >
+      <span className="text-base flex-shrink-0">{roleIcon}</span>
+      <div className="flex-1 min-w-0 text-left">
+        <p className="text-[9px] uppercase tracking-[0.18em] text-zinc-500 leading-tight">{roleLabel}</p>
+        <p className="text-xs font-semibold truncate leading-tight mt-0.5">{model.label}</p>
+      </div>
+      <span
+        key={syncTick}
+        style={{ animation: "var(--animate-sync-blink)" }}
+        className={`w-2 h-2 rounded-full flex-shrink-0 ${
+          exhausted     ? "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)] animate-pulse"
+          : isSubscribed ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.7)]"
+          : configured  ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.7)]"
+                        : "bg-amber-400"
+        }`}
+      />
+    </button>
+  );
+}
+
+function ModelGroup({ label, icon, children }: { label: string; icon: string; children: React.ReactNode }) {
+  return (
+    <div className="border-b border-white/[0.05] last:border-b-0">
+      <div className="px-3 py-1.5 bg-white/[0.02] flex items-center gap-2">
+        <span className="text-[11px]">{icon}</span>
+        <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-400">{label}</p>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ModelDropdownRow({
+  model, isActive, activeRoleLabel, providerStatus, quotaState, isSubscribed, onPick, onSubscribe, onUnsubscribe, removable, onRemove,
+}: {
+  model: ModelOption;
+  isActive: boolean;
+  activeRoleLabel: string;
+  providerStatus: ProviderStatus | null;
+  quotaState: QuotaState;
+  isSubscribed: boolean;
+  onPick: (m: ImageModel) => void;
+  onSubscribe: (m: ImageModel) => void;
+  onUnsubscribe: (m: ImageModel) => void;
+  removable?: boolean;
+  onRemove?: () => void;
+}) {
+  const status = modelStatusOf(model, providerStatus, quotaState);
+  const exhausted = status === "quota_exhausted";
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onPick(model.value)}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(model.value); } }}
+      className={`relative w-full flex items-start justify-between px-3 py-2.5 text-left transition-all hover:bg-white/5 gap-2 border-l-2 cursor-pointer ${
+        exhausted     ? "bg-rose-900/15 border-l-rose-400 shadow-[inset_0_0_0_1px_rgba(244,63,94,0.18)]"
+        : isSubscribed ? "bg-cyan-900/15 border-l-cyan-400 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.18)]"
+        : isActive    ? "bg-indigo-600/15 border-l-indigo-400 shadow-[inset_0_0_0_1px_rgba(99,102,241,0.15)]"
+                      : "border-l-transparent"
+      }`}
+    >
+      {removable && onRemove && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          aria-label={`Remove ${model.label}`}
+          title="Remove from your platform"
+          className="absolute top-1.5 right-1.5 z-10 w-5 h-5 rounded-full bg-rose-600/30 hover:bg-rose-500/60 border border-rose-400/40 hover:border-rose-300 text-rose-100 hover:text-white text-[10px] font-bold flex items-center justify-center transition"
+        >
+          ×
+        </button>
+      )}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className={`text-xs font-medium ${exhausted ? "text-rose-200" : isSubscribed ? "text-cyan-100" : isActive ? "text-white" : "text-zinc-300"}`}>{model.label}</span>
+          {model.badge && (
+            <span className="text-[9px] rounded-full bg-indigo-600/20 border border-indigo-500/20 px-1.5 py-0.5 text-indigo-400 flex-shrink-0">{model.badge}</span>
+          )}
+          <PriceBadge tier={model.tier} />
+          <ActivationBadge status={status} />
+          <SubscribedBadge show={isSubscribed} onUnsubscribe={() => onUnsubscribe(model.value)} />
+          {isActive && (
+            <span className="text-[9px] font-bold uppercase tracking-wider rounded-full bg-emerald-600/25 border border-emerald-400/40 px-1.5 py-0.5 text-emerald-200 flex-shrink-0">
+              ✓ {activeRoleLabel}
+            </span>
+          )}
+        </div>
+        <div className="text-[9px] text-zinc-600 mt-0.5">{model.provider} · <span className="text-emerald-400/80">{model.pricing}</span></div>
+        {model.note && <div className="text-[9px] text-zinc-500 mt-0.5 leading-tight mb-1.5">{model.note}</div>}
+
+        {model.providerKey !== "free" && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onSubscribe(model.value); }}
+            className="mt-1 inline-flex items-center gap-1 rounded-lg bg-[image:linear-gradient(to_right,var(--accent-from),var(--accent-to))] hover:opacity-90 px-2.5 py-1 text-[10px] font-bold text-white shadow-md shadow-indigo-900/30 transition-all"
+            title={`Open ${providerDisplayName(model.providerKey)} billing in new tab and select ${model.label}`}
+          >
+            {subscribeLabel(model.providerKey)} ↗
+          </button>
+        )}
+      </div>
+      {isActive && (
+        <span className="flex items-center justify-center w-4 h-4 rounded-full bg-indigo-500 flex-shrink-0 mt-0.5">
+          <CheckSmIcon />
+        </span>
+      )}
+    </div>
+  );
+}
 
 function NavItem({
   icon, label, tip, active, onClick, comingSoon, disabled, locked,
@@ -1255,8 +1874,9 @@ function NavItem({
 
 function SidebarDivider({ label }: { label: string }) {
   return (
-    <div className="px-5 pt-5 pb-1.5">
-      <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-zinc-600">{label}</p>
+    <div className="px-4 pt-5 pb-1.5 flex items-center gap-3">
+      <p className="text-[10px] font-bold uppercase tracking-[0.20em] text-zinc-600 flex-shrink-0">{label}</p>
+      <div className="flex-1 h-px bg-white/[0.05]" />
     </div>
   );
 }
@@ -1325,6 +1945,15 @@ function HomeView({
   onSubscribeModel,
   onUnsubscribeModel,
   syncTick,
+  userAddedIds,
+  onPickFromSearch,
+  effectiveModelOptions,
+  isUserAdded,
+  onRequestRemoveModel,
+  showHiddenBuiltIns,
+  onToggleShowHidden,
+  hasHidden,
+  modelHealthMap,
 }: {
   onCreateProject: () => void;
   selectedModel: ImageModel;
@@ -1334,6 +1963,15 @@ function HomeView({
   onSubscribeModel: (m: ImageModel) => void;
   onUnsubscribeModel: (m: ImageModel) => void;
   syncTick: number;
+  userAddedIds: string[];
+  onPickFromSearch: (entry: CatalogueEntry) => void;
+  effectiveModelOptions: ModelOption[];
+  isUserAdded: (m: ImageModel) => boolean;
+  onRequestRemoveModel: (m: ModelOption) => void;
+  showHiddenBuiltIns: boolean;
+  onToggleShowHidden: () => void;
+  hasHidden: boolean;
+  modelHealthMap: Record<string, ModelHealth>;
 }) {
   return (
     <div className="px-10 py-10 max-w-6xl mx-auto w-full animate-fade-in">
@@ -1362,21 +2000,56 @@ function HomeView({
       </div>
 
       <div className="border-t border-white/[0.07] pt-10 mb-10">
-        <h2 className="text-xl font-extrabold mb-5 tracking-tight">
-          <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Models</span>{" "}
-          <span className="text-white">Available</span>
-        </h2>
+        <div className="flex items-end justify-between gap-4 mb-5 flex-wrap">
+          <div>
+            <h2 className="text-xl font-extrabold tracking-tight">
+              <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Models</span>{" "}
+              <span className="text-white">Available</span>
+            </h2>
+            <p className="text-[11px] text-zinc-500 mt-1">
+              {effectiveModelOptions.length} model{effectiveModelOptions.length === 1 ? "" : "s"} ·
+              click any × to remove · search to add more
+            </p>
+          </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            {hasHidden && (
+              <button
+                type="button"
+                onClick={onToggleShowHidden}
+                className={`text-[11px] px-3 py-2 rounded-lg border transition ${
+                  showHiddenBuiltIns
+                    ? "bg-amber-500/15 border-amber-400/40 text-amber-200"
+                    : "bg-white/[0.03] border-white/[0.08] text-zinc-300 hover:border-white/[0.22]"
+                }`}
+                title="Toggle visibility of models you've previously hidden"
+              >
+                {showHiddenBuiltIns ? "Hiding shown ✓" : "Show hidden"}
+              </button>
+            )}
+            <div className="w-full sm:w-[300px]">
+              <ModelSearch addedIds={userAddedIds} onPick={onPickFromSearch} />
+            </div>
+          </div>
+        </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-          {MODEL_OPTIONS.map((m) => {
+          {effectiveModelOptions.map((m) => {
             const isActive = m.value === selectedModel;
             const status = modelStatusOf(m, providerStatus, quotaState);
             const exhausted = status === "quota_exhausted";
             const subscribed = subscribedModels.has(m.value);
+            const health = modelHealthMap[m.value];
+            const isSuggestedForRemoval = health?.suggestForRemoval ?? false;
+            // Every card gets an × — built-ins prompt confirmation (with key-cleanup
+            // option), user-added entries also confirm. The handler routes both via
+            // the shared confirm modal in ProjectPage.
+            const removable = true;
             return (
               <div
                 key={m.value}
-                className={`flex flex-col gap-2.5 rounded-xl px-4 py-3.5 transition-all ${
-                  exhausted
+                className={`relative flex flex-col gap-2.5 rounded-xl px-4 py-3.5 transition-all ${
+                  isSuggestedForRemoval
+                    ? "bg-rose-950/20 border border-rose-700/30"
+                    : exhausted
                     ? "bg-rose-900/15 border border-rose-500/40 shadow-[0_0_0_1px_rgba(244,63,94,0.25)]"
                     : subscribed
                     ? "bg-gradient-to-br from-cyan-900/20 to-teal-900/15 border border-cyan-400/40 shadow-[0_0_0_1px_rgba(34,211,238,0.3),0_0_24px_-8px_rgba(34,211,238,0.4)]"
@@ -1385,6 +2058,17 @@ function HomeView({
                     : "bg-white/[0.04] border border-white/[0.08] hover:bg-white/[0.07]"
                 }`}
               >
+                {removable && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onRequestRemoveModel(m); }}
+                    aria-label={`Remove ${m.label}`}
+                    title={isUserAdded(m.value) ? "Remove from your platform" : "Hide this built-in model"}
+                    className="absolute top-2 right-2 z-10 w-6 h-6 rounded-full bg-rose-600/30 hover:bg-rose-500/60 border border-rose-400/40 hover:border-rose-300 text-rose-100 hover:text-white text-xs font-bold flex items-center justify-center transition"
+                  >
+                    ×
+                  </button>
+                )}
                 <div className="flex items-start gap-3">
                   <span
                     key={syncTick}
@@ -1408,10 +2092,19 @@ function HomeView({
                       <PriceBadge tier={m.tier} />
                       <ActivationBadge status={status} />
                       <SubscribedBadge show={subscribed} onUnsubscribe={() => onUnsubscribeModel(m.value)} />
+                      {health && <HealthBadge health={health} />}
                     </div>
                     <div className="text-xs text-zinc-500 mt-1">{m.provider}</div>
                     <div className={`text-xs mt-1 font-semibold tabular-nums ${exhausted ? "text-rose-300/80 line-through" : "text-emerald-400/90"}`}>{m.pricing}</div>
                     {m.note && <div className="text-xs text-zinc-500 mt-1.5 leading-relaxed">{m.note}</div>}
+                    {isSuggestedForRemoval && (
+                      <div className="mt-2 flex items-center gap-1.5 text-[10px] text-rose-300/80 font-semibold">
+                        <span>⚠</span>
+                        <span>Suggested for removal</span>
+                        <span className="text-rose-400/50">—</span>
+                        <span className="text-rose-300/60 font-normal">{health?.reason}</span>
+                      </div>
+                    )}
                   </div>
                   {isActive && (
                     <span className="flex items-center justify-center w-6 h-6 rounded-full bg-indigo-500 flex-shrink-0">
@@ -1445,16 +2138,9 @@ function HomeView({
         </div>
       </div>
 
-      <div className="rounded-2xl bg-indigo-900/10 border border-indigo-500/15 p-6 flex items-start gap-5">
-        <div className="w-12 h-12 rounded-xl bg-indigo-600/20 border border-indigo-500/20 flex items-center justify-center text-2xl flex-shrink-0">💡</div>
-        <div>
-          <p className="text-base font-bold text-white mb-1.5">Pro Tip — Use AI Assist</p>
-          <p className="text-sm text-zinc-400 leading-relaxed">
-            Only Game Title and Theme are required. Click{" "}
-            <span className="text-indigo-300 font-semibold">✦ Fill All</span> to let AI complete the entire brief from just those two fields.
-          </p>
-        </div>
-      </div>
+      {/* Trending AI Models — auto-scrolling carousel of latest models per role.
+          Replaces the old Pro Tip card here (Pro Tip moved to top of form view). */}
+      <TrendingAIBanner onPick={onPickFromSearch} />
     </div>
   );
 }
@@ -1698,6 +2384,47 @@ function ActivationBadge({ status }: { status: ModelStatus }) {
       Needs API key
     </span>
   );
+}
+
+// Health status pill — rendered on model cards from the 30s watchdog data.
+// Only shows statuses that add information not already in ActivationBadge.
+function HealthBadge({ health }: { health: ModelHealth }) {
+  if (health.status === "healthy") {
+    return (
+      <span className="text-[9px] rounded-full bg-emerald-600/15 border border-emerald-500/20 px-1.5 py-0.5 text-emerald-400 flex-shrink-0">
+        Healthy
+      </span>
+    );
+  }
+  if (health.status === "quota-out") {
+    return (
+      <span className="text-[9px] rounded-full bg-rose-600/30 border border-rose-500/50 px-1.5 py-0.5 text-rose-200 flex-shrink-0 font-bold animate-pulse">
+        Quota out
+      </span>
+    );
+  }
+  if (health.status === "stale") {
+    return (
+      <span className="text-[9px] rounded-full bg-rose-900/30 border border-rose-700/40 px-1.5 py-0.5 text-rose-400/80 flex-shrink-0">
+        Stale
+      </span>
+    );
+  }
+  if (health.status === "not-relevant") {
+    return (
+      <span className="text-[9px] rounded-full bg-zinc-700/40 border border-zinc-600/30 px-1.5 py-0.5 text-zinc-500 flex-shrink-0">
+        No API
+      </span>
+    );
+  }
+  if (health.status === "preview-only") {
+    return (
+      <span className="text-[9px] rounded-full bg-indigo-700/20 border border-indigo-500/25 px-1.5 py-0.5 text-indigo-400 flex-shrink-0">
+        Preview
+      </span>
+    );
+  }
+  return null;
 }
 
 interface SubscriptionModalProps {

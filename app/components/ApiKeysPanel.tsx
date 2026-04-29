@@ -134,8 +134,14 @@ export default function ApiKeysPanel({ open, onClose, onChanged }: { open: boole
           )}
         </div>
 
-        <footer className="flex-shrink-0 px-6 py-4 border-t border-white/[0.07] text-[11px] text-zinc-500 leading-relaxed">
-          USER role can run the app with these keys but cannot view or edit them. Panel keys override <span className="font-mono">.env.local</span>.
+        <footer className="flex-shrink-0 px-6 py-4 border-t border-white/[0.07] text-[11px] text-zinc-500 leading-relaxed space-y-2">
+          <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5 text-emerald-200/90">
+            <p className="font-semibold text-emerald-200">✓ Primary source of API keys</p>
+            <p className="mt-1 text-[11px] text-emerald-100/70">
+              Every AI route (generation, suggestions, prompt expansion) reads keys from this panel <span className="font-semibold">first</span>, then falls back to <span className="font-mono">.env.local</span> only if no panel value exists. Each model card&apos;s <span className="font-semibold">Source: Panel / Env / Not set</span> chip shows where the active key is coming from in real time.
+            </p>
+          </div>
+          <p>USER role can run the app with these keys but cannot view or edit them.</p>
         </footer>
       </aside>
     </div>
@@ -328,8 +334,13 @@ function SourceBadge({ source }: { source: Source }) {
     none:  "border-zinc-500/30 bg-zinc-500/10 text-zinc-300",
   };
   const label: Record<Source, string> = { panel: "Panel", env: "Env", none: "Not set" };
+  const tooltip: Record<Source, string> = {
+    panel: "Active key is from this panel (encrypted at rest). The app reads here first.",
+    env:   "Active key is from .env.local. To override at runtime, set a key in the panel above.",
+    none:  "No key configured — generation will fall through to the free Pollinations fallback.",
+  };
   return (
-    <span className={`text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full border ${styles[source]}`}>
+    <span title={tooltip[source]} className={`text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full border cursor-help ${styles[source]}`}>
       {label[source]}
     </span>
   );

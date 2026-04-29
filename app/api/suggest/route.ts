@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 import OpenAI from "openai";
 import { getProviderKey } from "@/app/lib/keys/providerKey";
+import { resolvePromptModel } from "@/app/lib/aiRoles";
+import { record, classifyError } from "@/app/lib/usage/tracker";
 
 const FIELD_META: Record<string, { label: string; hint: string }> = {
   gameName:      { label: "Game Title",       hint: "Name of the slot game" },
@@ -36,7 +38,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: "No API key configured" }, { status: 503 });
   }
 
-  let body: { field: string; form: Record<string, string> };
+  let body: { field: string; form: Record<string, string>; promptModel?: string };
   try {
     body = await request.json();
   } catch {
@@ -44,6 +46,14 @@ export async function POST(request: NextRequest) {
   }
 
   const { field, form } = body;
+  const model = resolvePromptModel(body.promptModel);
+
+  // Wrap the OpenAI call so we can record outcome to the usage tracker —
+  // success or any failure shape (quota / auth / rate limit / network).
+  const trackOutcome = (outcome: import("@/app/lib/usage/tracker").UsageOutcome, reason?: string) => {
+    record({ provider: "openai", role: "prompt", outcome, modelId: model, reason });
+  };
+  void trackOutcome; // referenced inside the try block below
   const meta = FIELD_META[field];
   if (!meta) {
     return Response.json({ error: "Unknown field" }, { status: 400 });
@@ -58,7 +68,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model,
       response_format: { type: "json_object" },
       max_tokens: 120,
       messages: [
@@ -82,6 +92,7 @@ export async function POST(request: NextRequest) {
     });
 
     const raw = JSON.parse(completion.choices[0].message.content ?? "{}");
+    trackOutcome("success");
     return Response.json({ suggestion: raw.suggestion ?? "" });
   } catch (err) {
     console.error("[suggest]", err);
@@ -96,6 +107,7 @@ export async function POST(request: NextRequest) {
     const status = e.status ?? 500;
     const code = e.code ?? "unknown_error";
     const message = e.message ?? "Suggestion failed";
+    trackOutcome(classifyError(err, status), message);
 
     // OpenAI sets `retry-after` (seconds) on rate-limit responses
     let retryAfterSec: number | undefined;

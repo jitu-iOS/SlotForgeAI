@@ -108,6 +108,13 @@ interface Props {
   isLoading: boolean;
   slotType: SlotType;
   onQuotaExhausted?: () => void;
+  // Notifies the page when a single-field AI suggestion fires (brief toast).
+  onPoweredBy?: (role: string, modelLabel: string, providerLabel: string) => void;
+  // Called once when Fill All starts (sticky toast) and once when it finishes.
+  onFillAllStart?: () => void;
+  onFillAllEnd?: () => void;
+  // The currently-selected Prompt Assistant model (sent to /api/suggest*).
+  promptModel?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +129,7 @@ type SuggestError = {
   fixLabel?: string;
 };
 
-export default function ProjectFormComponent({ onSubmit, isLoading, slotType, onQuotaExhausted }: Props) {
+export default function ProjectFormComponent({ onSubmit, isLoading, slotType, onQuotaExhausted, onPoweredBy, onFillAllStart, onFillAllEnd, promptModel }: Props) {
   const slotConfig = getSlotConfig(slotType);
   // Merge slot-type overrides into FIELD_META so example placeholders + tips
   // shift to match what's typical for that reel layout.
@@ -162,7 +169,7 @@ export default function ProjectFormComponent({ onSubmit, isLoading, slotType, on
         const res = await fetch("/api/suggest", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ field, form: textFields }),
+          body: JSON.stringify({ field, form: textFields, promptModel }),
         });
         const data = (await res.json().catch(() => ({}))) as {
           suggestion?: string;
@@ -200,22 +207,29 @@ export default function ProjectFormComponent({ onSubmit, isLoading, slotType, on
     const keys = Object.keys(EMPTY_FORM).filter(
       (k) => k !== "assetTypes" && !(form as Record<string, unknown>)[k]
     ) as TextFieldKey[];
-    for (const key of keys) {
-      const result = await suggestField(key);
-      if (!result.ok) {
-        setSuggestError(result.error);
-        return; // stop the loop — don't burn through 25 failing requests
+    if (keys.length === 0) return;
+    onFillAllStart?.();
+    try {
+      for (const key of keys) {
+        const result = await suggestField(key);
+        if (!result.ok) {
+          setSuggestError(result.error);
+          return;
+        }
       }
+    } finally {
+      onFillAllEnd?.();
     }
-  }, [form, suggestField]);
+  }, [form, suggestField, onFillAllStart, onFillAllEnd]);
 
   const handleSuggestSingle = useCallback(
     async (field: TextFieldKey) => {
       setSuggestError(null);
+      onPoweredBy?.("Prompt assistant", "GPT-4o-mini", "OpenAI");
       const result = await suggestField(field);
       if (!result.ok) setSuggestError(result.error);
     },
-    [suggestField]
+    [suggestField, onPoweredBy]
   );
 
   const isValid =

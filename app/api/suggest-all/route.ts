@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 import OpenAI from "openai";
 import { getProviderKey } from "@/app/lib/keys/providerKey";
+import { resolvePromptModel } from "@/app/lib/aiRoles";
+import { record, classifyError } from "@/app/lib/usage/tracker";
 
 const FIELD_HINTS: Record<string, string> = {
   theme:          "Core theme and world of the slot (e.g. Egyptian luxury mystical)",
@@ -35,7 +37,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: "No API key configured" }, { status: 503 });
   }
 
-  let body: { form: Record<string, string> };
+  let body: { form: Record<string, string>; promptModel?: string };
   try {
     body = await request.json();
   } catch {
@@ -43,6 +45,7 @@ export async function POST(request: NextRequest) {
   }
 
   const { form } = body;
+  const model = resolvePromptModel(body.promptModel);
 
   // Determine which fields need to be filled (empty in the current form)
   const emptyFields = Object.keys(FIELD_HINTS).filter(
@@ -69,7 +72,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model,
       response_format: { type: "json_object" },
       max_tokens: 1200,
       messages: [
@@ -101,9 +104,12 @@ export async function POST(request: NextRequest) {
       if (raw[key]?.trim()) suggestions[key] = raw[key].trim();
     }
 
+    record({ provider: "openai", role: "prompt", outcome: "success", modelId: model });
     return Response.json({ suggestions });
   } catch (err) {
     console.error("[suggest-all]", err);
+    const e = err as { status?: number; message?: string };
+    record({ provider: "openai", role: "prompt", outcome: classifyError(err, e.status), modelId: model, reason: e.message });
     return Response.json({ error: "Suggestion failed" }, { status: 500 });
   }
 }

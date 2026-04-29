@@ -2,6 +2,15 @@ import type { NextRequest } from "next/server";
 import OpenAI from "openai";
 import type { Asset, AssetType, StyleDNA, ImageModel } from "@/app/types";
 import { getProviderKey } from "@/app/lib/keys/providerKey";
+import { record, classifyError } from "@/app/lib/usage/tracker";
+
+function inferProvider(model?: string): string {
+  if (!model || model === "gpt-image-1" || model === "dall-e-3") return "openai";
+  if (model.includes("imagineart")) return "imagineart";
+  if (model.includes("pollinations") || model.includes("free")) return "free";
+  if (model.includes("runway")) return "runway";
+  return "replicate";
+}
 
 export const maxDuration = 120;
 
@@ -25,7 +34,7 @@ async function buildEditPrompt(
   originalPrompt: string,
   instruction: string,
   styleDNA: StyleDNA,
-  apiKey: string | undefined
+  apiKey: string | null | undefined
 ): Promise<string> {
   // Strip any previous edit annotations so prompts don't stack endlessly
   const basePrompt = originalPrompt
@@ -60,8 +69,12 @@ async function buildEditPrompt(
         ],
       });
       const raw = JSON.parse(completion.choices[0].message.content ?? "{}");
-      if (raw.prompt?.trim()) return raw.prompt.trim();
+      if (raw.prompt?.trim()) {
+        record({ provider: "openai", role: "prompt", outcome: "success", modelId: "gpt-4o-mini" });
+        return raw.prompt.trim();
+      }
     } catch (err) {
+      record({ provider: "openai", role: "prompt", outcome: classifyError(err), modelId: "gpt-4o-mini", reason: err instanceof Error ? err.message : undefined });
       console.error("[edit-asset] GPT prompt rewrite failed:", err);
     }
   }
@@ -111,9 +124,11 @@ export async function POST(request: NextRequest) {
     selected: false,
   };
 
+  const imgProvider = inferProvider(imageModel);
   try {
     const { generateSingleImage } = await import("@/app/lib/mockImageGenerator");
     const generated = await generateSingleImage(stub, styleDNA, imageModel);
+    record({ provider: imgProvider, role: "image", outcome: "success", modelId: imageModel });
 
     // Return the generated asset; annotate the prompt so history shows the edit
     return Response.json({
@@ -124,6 +139,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (err) {
     console.error("[edit-asset] generation failed:", err);
+    record({ provider: imgProvider, role: "image", outcome: classifyError(err), modelId: imageModel, reason: err instanceof Error ? err.message : undefined });
     return Response.json(
       { error: err instanceof Error ? err.message : "Generation failed" },
       { status: 500 }

@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { SESSION_COOKIE, verifySession } from "@/app/lib/auth/jwt";
 
-const PROTECTED_PREFIXES = ["/project", "/dashboard"];
+const PROTECTED_PREFIXES = ["/project", "/dashboard", "/build"];
 const AUTH_PAGE = "/login";
 
 function isProtected(pathname: string): boolean {
@@ -27,5 +27,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/", "/login", "/project/:path*", "/dashboard/:path*"],
+  matcher: ["/", "/login", "/project/:path*", "/dashboard/:path*", "/build/:path*"],
 };

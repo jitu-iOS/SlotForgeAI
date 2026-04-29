@@ -3,6 +3,7 @@ import type { NextRequest } from "next/server";
 export const maxDuration = 120;
 import { rebuildSingleAsset } from "@/app/lib/promptBuilder";
 import { generateMockImages } from "@/app/lib/mockImageGenerator";
+import { record, classifyError } from "@/app/lib/usage/tracker";
 import type { StyleDNA, AssetType } from "@/app/types";
 
 const VALID_TYPES: AssetType[] = ["symbol_low", "symbol_high", "background", "ui", "fx"];
@@ -33,8 +34,14 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: `Invalid assetType: ${assetType}` }, { status: 400 });
   }
 
-  const assetStub = await rebuildSingleAsset(styleDNA, assetType, assetLabel, assetId);
-  const [asset] = await generateMockImages([assetStub], styleDNA);
-
-  return Response.json({ asset });
+  try {
+    const assetStub = await rebuildSingleAsset(styleDNA, assetType, assetLabel, assetId);
+    const [asset] = await generateMockImages([assetStub], styleDNA);
+    record({ provider: "openai", role: "image", outcome: "success" });
+    return Response.json({ asset });
+  } catch (err) {
+    console.error("[regenerate]", err);
+    record({ provider: "openai", role: "image", outcome: classifyError(err), reason: err instanceof Error ? err.message : undefined });
+    return Response.json({ error: "Regeneration failed" }, { status: 500 });
+  }
 }

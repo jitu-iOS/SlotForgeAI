@@ -55,6 +55,7 @@ export default function AssetGrid({
 }: AssetGridProps) {
   const [filter, setFilter] = useState<FilterTab>("all");
   const [editTarget, setEditTarget] = useState<Asset | null>(null);
+  const [previewAsset, setPreviewAsset] = useState<Asset | null>(null);
 
   const presentTypes = TYPE_ORDER.filter((t) => assets.some((a) => a.type === t));
   const visible = filter === "all" ? assets : assets.filter((a) => a.type === filter);
@@ -128,6 +129,7 @@ export default function AssetGrid({
                       onToggleSelect={onToggleSelect}
                       onRegenerate={onRegenerate}
                       onOpenEdit={(a) => setEditTarget(a)}
+                      onPreview={(a) => setPreviewAsset(a)}
                     />
                   ))}
                 </div>
@@ -146,6 +148,11 @@ export default function AssetGrid({
           onClose={() => setEditTarget(null)}
         />
       )}
+
+      {/* Fullscreen preview — opened on double-click, closes on Esc / backdrop / ✕ */}
+      {previewAsset && (
+        <FullscreenPreview asset={previewAsset} onClose={() => setPreviewAsset(null)} />
+      )}
     </>
   );
 }
@@ -155,13 +162,14 @@ export default function AssetGrid({
 // ---------------------------------------------------------------------------
 
 function AssetCard({
-  asset, isRegenerating, onToggleSelect, onRegenerate, onOpenEdit,
+  asset, isRegenerating, onToggleSelect, onRegenerate, onOpenEdit, onPreview,
 }: {
   asset: Asset;
   isRegenerating: boolean;
   onToggleSelect: (id: string) => void;
   onRegenerate: (id: string) => void;
   onOpenEdit: (asset: Asset) => void;
+  onPreview: (asset: Asset) => void;
 }) {
   const [showPrompt, setShowPrompt] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -185,10 +193,12 @@ function AssetCard({
           : "cursor-pointer border border-white/10 hover:border-white/25"
       }`}
     >
-      {/* Image */}
+      {/* Image — single-click toggles selection, double-click opens fullscreen preview */}
       <div
         className="aspect-square bg-zinc-900 relative overflow-hidden"
         onClick={() => !isRegenerating && onToggleSelect(asset.id)}
+        onDoubleClick={(e) => { e.stopPropagation(); if (!isRegenerating && asset.imageUrl) onPreview(asset); }}
+        title="Click to select · double-click to preview"
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
@@ -478,6 +488,123 @@ function CheckIcon() {
   return (
     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="20 6 9 17 4 12"/>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fullscreen preview — opens on double-click, has download button
+// ---------------------------------------------------------------------------
+
+function FullscreenPreview({ asset, onClose }: { asset: Asset; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = "";
+    };
+  }, [onClose]);
+
+  const handleDownload = async () => {
+    try {
+      const safe = (asset.label || "asset").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const ext  = asset.imageUrl.startsWith("data:image/jpeg") ? "jpg" : "png";
+      const filename = `${safe || "asset"}.${ext}`;
+
+      let href = asset.imageUrl;
+      // For non-data URLs (rare but possible), fetch + convert to blob URL so the
+      // browser's `download` attribute works cross-origin.
+      if (!asset.imageUrl.startsWith("data:")) {
+        const res = await fetch(asset.imageUrl);
+        const blob = await res.blob();
+        href = URL.createObjectURL(blob);
+      }
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      if (!asset.imageUrl.startsWith("data:")) URL.revokeObjectURL(href);
+    } catch (err) {
+      console.error("[FullscreenPreview] download failed:", err);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center px-4 py-6"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{ animation: "fade-in 0.18s ease-out" }}
+    >
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/85 backdrop-blur-md"
+        onClick={onClose}
+      />
+
+      {/* Content */}
+      <div className="relative z-10 max-w-[92vw] max-h-[92vh] flex flex-col items-center gap-4">
+        {/* Image */}
+        <div
+          className="rounded-2xl overflow-hidden border border-white/10 shadow-[0_30px_80px_-20px_rgba(0,0,0,0.8)]"
+          style={{ background: "rgba(0,0,0,0.6)" }}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={asset.imageUrl}
+            alt={asset.label}
+            className="block max-w-[88vw] max-h-[78vh] object-contain"
+            draggable={false}
+          />
+        </div>
+
+        {/* Toolbar */}
+        <div className="flex items-center gap-2 flex-wrap justify-center bg-black/55 backdrop-blur-md border border-white/[0.08] rounded-2xl px-3 py-2">
+          <div className="text-left pr-3 border-r border-white/10 mr-1">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-zinc-500 leading-tight">{asset.type.replace("_", " ")}</p>
+            <p className="text-sm font-medium text-zinc-100 leading-tight">{asset.label}</p>
+          </div>
+          <button
+            type="button"
+            onClick={handleDownload}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-500 hover:opacity-95 active:scale-[0.98] px-4 py-2 text-sm font-semibold text-white shadow-md shadow-indigo-900/40 transition-all"
+            title="Download this asset"
+          >
+            <DownloadIcon /> Download
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex items-center gap-1 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] hover:border-white/[0.22] px-3 py-2 text-xs text-zinc-300 hover:text-white transition-all"
+            title="Close (Esc)"
+          >
+            Close · Esc
+          </button>
+        </div>
+      </div>
+
+      {/* Top-right close ✕ for parity with other modals */}
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label="Close preview"
+        className="absolute top-5 right-5 z-20 w-10 h-10 rounded-full bg-white/[0.08] hover:bg-white/[0.18] border border-white/[0.12] hover:border-white/[0.28] flex items-center justify-center text-zinc-200 hover:text-white text-xl leading-none transition"
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
     </svg>
   );
 }
